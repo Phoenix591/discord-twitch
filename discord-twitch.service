@@ -1,0 +1,64 @@
+[Unit]
+Description=Discord Twitch Webhook Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# =======================================================
+# 1. IDENTITY & EXECUTION
+# =======================================================
+DynamicUser=yes
+User=discord-twitch
+Group=discord-twitch
+
+# Run the script directly (Shebang handles the python path)
+ExecStart=/usr/local/discord-twitch/bot.py
+
+# Inject the secret.cfg securely
+LoadCredential=secret.cfg:/usr/local/discord-twitch/secret.cfg
+
+# =======================================================
+# 2. STATELESS / EPHEMERAL ENV
+# =======================================================
+# Give the process its own private /tmp directory
+PrivateTmp=yes
+# Set the working directory to that private /tmp
+# Any cache files (.tio.tokens.json) written here vanish on stop.
+WorkingDirectory=/tmp
+
+# =======================================================
+# 3. FILESYSTEM LOCKDOWN
+# =======================================================
+# The entire filesystem is Read-Only...
+ProtectSystem=strict
+# ...except for the private /tmp we just created.
+# (Systemd handles the exception for /tmp automatically with PrivateTmp=yes)
+
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# =======================================================
+# 4. NETWORK & CAPABILITIES
+# =======================================================
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# =======================================================
+# 5. LIFECYCLE
+# =======================================================
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

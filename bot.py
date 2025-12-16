@@ -4,7 +4,8 @@ import logging
 import discord
 import configparser
 import os
-from discord.ext import commands
+import datetime
+from discord.ext import commands, tasks  # <--- NEW: Import tasks
 import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
@@ -14,43 +15,35 @@ from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscriptio
 # ==========================================
 
 config = configparser.ConfigParser()
-
-# Systemd LoadCredential logic
+# ... (Config loading logic remains the same) ...
 credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
 if credential_dir:
-    # If running via Systemd, look here
     configfile = os.path.join(credential_dir, "secret.cfg")
 else:
-    # Fallback for manual testing/running
     configfile = os.path.expanduser("/usr/local/discord-twitch/secret.cfg")
-
-if not os.path.exists(configfile):
-    raise FileNotFoundError(f"Configuration file not found at: {configfile}")
-
 config.read(configfile)
 
-# 1. DISCORD CONFIG
+# 1. DISCORD
 DISCORD_TOKEN = config['discord']['token']
 DISCORD_CHANNEL_ID = int(config['discord']['channelid']) 
 
-# 2. TWITCH CONFIG
+# 2. TWITCH
 TWITCH_CLIENT_ID = config['twitch']['clientid']
 TWITCH_CLIENT_SECRET = config['twitch']['clientsecret']
 TWITCH_EVENTSUB_SECRET = config['twitch']['eventsub_secret']
 
-# 3. SERVER CONFIG
+# 3. SERVER
 SERVER_DOMAIN = config['server']['domain']
 PUBLIC_URL = config['server']['public_url']
 LOCAL_PORT = int(config['server']['port'])
+# NEW: Get the debug interval (default to 30 if missing)
+DEBUG_INTERVAL = int(config['server'].get('debug_interval', 30))
 
-# 4. LOAD STREAMERS
+# 4. STREAMERS
 STREAMERS_TO_TRACK = {}
 if 'streamers' in config:
     for streamer_id, display_name in config['streamers'].items():
-        # Ensure ID is a string for TwitchIO v3
         STREAMERS_TO_TRACK[str(streamer_id)] = display_name
-else:
-    print("WARNING: No [streamers] section found in config file!")
 
 # ==========================================
 #           GLOBAL STATE & LOGGING
@@ -70,6 +63,7 @@ logger = logging.getLogger("Bot")
 # ==========================================
 
 intents = discord.Intents.default()
+intents.message_content = True
 discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
@@ -78,12 +72,11 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 class TwitchBot(twitchio.Client):
     def __init__(self):
-        # Initialize the Web Adapter (Removed invalid 'api=True' arg)
         adapter = AiohttpAdapter(
             port=LOCAL_PORT,
-            domain=SERVER_DOMAIN
+            domain=SERVER_DOMAIN,
+            eventsub_secret=TWITCH_EVENTSUB_SECRET 
         )
-        
         super().__init__(
             client_id=TWITCH_CLIENT_ID,
             client_secret=TWITCH_CLIENT_SECRET,
@@ -92,55 +85,112 @@ class TwitchBot(twitchio.Client):
 
     async def event_ready(self):
         logger.info(f"✅ Twitch Webhook Server listening on port {LOCAL_PORT}")
-        logger.info(f"🌐 Configured Public URL: {PUBLIC_URL}")
         
-        # Cleanup old subs to ensure fresh start
+        # --- NEW: Rebuild Cache from Discord History ---
+        # We must ensure Discord is ready before we ask it for message history
+        await discord_bot.wait_until_ready()
+        await self.populate_message_cache()
+        # -----------------------------------------------
+
+        # Cleanup old subs
         try:
             await self.delete_all_eventsub_subscriptions()
         except Exception:
             pass
 
         logger.info(f"📋 Subscribing {len(STREAMERS_TO_TRACK)} channels...")
+        
+        # ... (Your existing subscription loop goes here) ...
+        for streamer_id, streamer_name in STREAMERS_TO_TRACK.items():
+            try:
+                # Online
+                online_sub = StreamOnlineSubscription(broadcaster_user_id=streamer_id, version="1")
+                await self.subscribe_webhook(payload=online_sub, callback_url=PUBLIC_URL)
+                # Offline
+                offline_sub = StreamOfflineSubscription(broadcaster_user_id=streamer_id, version="1")
+                await self.subscribe_webhook(payload=offline_sub, callback_url=PUBLIC_URL)
+                logger.info(f"   ➜ Subscribed: {streamer_name} (ID: {streamer_id})")
+            except Exception as e:
+                logger.error(f"   ❌ Failed {streamer_name}: {e}")
+
+    async def populate_message_cache(self):
+        """
+        Scans recent Discord messages to find active 'Live' alerts
+        and restores them to memory so we can edit them later.
+        """
+        logger.info("🧠 Scanning Discord history to rebuild state...")
+        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        
+        if not channel:
+            logger.error("❌ Cannot fetch history: Channel not found.")
+            return
+
+        try:
+            # Scan the last 50 messages (Adjust limit if your channel is very busy)
+            async for message in channel.history(limit=50):
+                
+                # 1. Ignore messages not by me
+                if message.author != discord_bot.user:
+                    continue
+                
+                # 2. Ignore messages without embeds
+                if not message.embeds:
+                    continue
+
+                embed = message.embeds[0]
+                
+                # 3. Check for the "Live" color (Purple: 0x9146FF -> Decimal: 9520895)
+                # If the embed is Grey (Offline), we ignore it.
+                if embed.color and embed.color.value == 9520895:
+                    
+                    # 4. Extract Streamer Name from URL (https://twitch.tv/ninja)
+                    if embed.url:
+                        # Get the last part of the URL (the login name)
+                        login_name_from_url = embed.url.split('/')[-1].lower()
+                        
+                        # 5. Reverse Lookup: Find the ID for this name
+                        # We need the ID because `active_messages` keys are IDs (from Twitch events)
+                        found_id = None
+                        for s_id, s_name in STREAMERS_TO_TRACK.items():
+                            # Compare against config names (case-insensitive)
+                            if s_name.lower() == login_name_from_url:
+                                found_id = s_id
+                                break
+                        
+                        if found_id:
+                            active_messages[found_id] = message
+                            logger.info(f"   ↳ ♻️  Restored state for: {login_name_from_url} (ID: {found_id})")
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to rebuild cache: {e}")
+        logger.info(f"📋 Subscribing {len(STREAMERS_TO_TRACK)} channels...")
 
         for streamer_id, streamer_name in STREAMERS_TO_TRACK.items():
             try:
-                # 1. Subscribe Online
-                # v3 Subscription Objects
+                # Subscribe Online
                 online_sub = StreamOnlineSubscription(broadcaster_user_id=streamer_id, version="1")
-                await self.subscribe_webhook(
-                    payload=online_sub,
-                    callback_url=PUBLIC_URL,
-                    eventsub_secret=TWITCH_EVENTSUB_SECRET
-                )
+                await self.subscribe_webhook(payload=online_sub, callback_url=PUBLIC_URL)
 
-                # 2. Subscribe Offline
+                # Subscribe Offline
                 offline_sub = StreamOfflineSubscription(broadcaster_user_id=streamer_id, version="1")
-                await self.subscribe_webhook(
-                    payload=offline_sub,
-                    callback_url=PUBLIC_URL,
-                    eventsub_secret=TWITCH_EVENTSUB_SECRET
-                )
+                await self.subscribe_webhook(payload=offline_sub, callback_url=PUBLIC_URL)
                 
                 logger.info(f"   ➜ Subscribed: {streamer_name} (ID: {streamer_id})")
             except Exception as e:
                 logger.error(f"   ❌ Failed {streamer_name}: {e}")
 
     async def event_stream_online(self, payload):
-        """Triggered when Twitch POSTs data to our server"""
-        event = payload.event
-        streamer_id = str(event.broadcaster_user_id)
-        streamer_name = event.broadcaster_user_name
+        streamer_id = str(payload.broadcaster.id)
+        streamer_name = payload.broadcaster.name
         
         logger.info(f"📣 WEBHOOK RECEIVED: {streamer_name} is LIVE")
         
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if not channel: 
-            logger.error(f"❌ Discord Channel {DISCORD_CHANNEL_ID} not found.")
-            return
+        if not channel: return
 
         embed = discord.Embed(
             title=f"🔴 {streamer_name} is LIVE!",
-            url=f"https://twitch.tv/{event.broadcaster_user_login}",
+            url=f"https://twitch.tv/{streamer_name}",
             color=0x9146FF
         )
         
@@ -154,18 +204,19 @@ class TwitchBot(twitchio.Client):
             logger.error(f"Discord Send Error: {e}")
 
     async def event_stream_offline(self, payload):
-        event = payload.event
-        streamer_id = str(event.broadcaster_user_id)
-        streamer_name = event.broadcaster_user_name
+        streamer_id = str(payload.broadcaster.id)
+        streamer_name = payload.broadcaster.name
         
         logger.info(f"🌑 WEBHOOK RECEIVED: {streamer_name} is OFFLINE")
 
         if streamer_id in active_messages:
             old_msg = active_messages[streamer_id]
             try:
+                timestamp = int(datetime.datetime.now().timestamp())
                 new_embed = discord.Embed(
                     title=f"⚫ {streamer_name} was live.",
-                    description="Stream ended.",
+                    description=f"Stream ended at <t:{timestamp}:T>.",
+                    url=f"https://twitch.tv/{streamer_name}",
                     color=0x2c2f33
                 )
                 await old_msg.edit(content=None, embed=new_embed)
@@ -174,18 +225,62 @@ class TwitchBot(twitchio.Client):
             del active_messages[streamer_id]
 
     async def event_error(self, payload):
-        logger.error(f"Twitch Error: {payload}")
+        logger.error(f"❌ Twitch Event Error: {payload.error}")
 
 twitch_bot = TwitchBot()
 
 # ==========================================
-#           RUNNING BOTH LOOPS
+#           DEBUG LOOP (NEW)
+# ==========================================
+@tasks.loop(seconds=DEBUG_INTERVAL)
+async def debug_status_check():
+    try:
+        # 1. Get the wrapper object
+        response = await twitch_bot.fetch_eventsub_subscriptions()
+        
+        # 2. Flatten the async iterator into a standard list
+        # response.subscriptions is an HTTPAsyncIterator, so we must use [async for ...]
+        current_subs = [s async for s in response.subscriptions]
+        
+        logger.info(f"🔎 DEBUG CHECK: Found {len(current_subs)} active subscriptions.")
+        
+        for sub in current_subs:
+            # Safely get the user_id from the condition dict
+            user_id = sub.condition.get('broadcaster_user_id', 'Unknown')
+            name = STREAMERS_TO_TRACK.get(user_id, f"ID_{user_id}")
+            
+            # Create a clean status log
+            status_icon = "⚠️"
+            if sub.status == 'enabled':
+                status_icon = "✅"
+            elif sub.status == 'webhook_callback_verification_pending':
+                status_icon = "⏳"
+            elif sub.status == 'webhook_callback_verification_failed':
+                status_icon = "❌"
+
+            logger.info(f"   {status_icon} {name} | Type: {sub.type} | Status: {sub.status}")
+
+    except Exception as e:
+        logger.error(f"❌ Debug Loop Error: {e}")
+
+@debug_status_check.before_loop
+async def before_debug_loop():
+# Wait for the bot to be fully ready before asking for data
+    await twitch_bot.wait_until_ready()
+# ==========================================
+#           RUNNING (UPDATED)
 # ==========================================
 
 @discord_bot.event
 async def setup_hook():
-    # Start the Twitch Client (which automatically starts the Web Server)
+    # Start the Twitch Client
     discord_bot.loop.create_task(twitch_bot.start())
+    # Start the Debug Loop
+    debug_status_check.start()
+
+@discord_bot.command()
+async def test(ctx):
+    await ctx.send("✅ System Normal.")
 
 if __name__ == "__main__":
     discord_bot.run(DISCORD_TOKEN)
