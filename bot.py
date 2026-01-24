@@ -10,17 +10,25 @@ import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
 
-# ==========================================
-#               CONFIGURATION
-# ==========================================
-
 config = configparser.ConfigParser()
-credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-if credential_dir:
-    configfile = os.path.join(credential_dir, "secret.cfg")
+
+cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+if cred_dir:
+    secret_path = os.path.join(cred_dir, "secret.cfg")
+    logger.info(f"🔒 Loading secrets from Systemd Credential: {secret_path}")
 else:
-    configfile = os.path.expanduser("/usr/local/discord-twitch/secret.cfg")
-config.read(configfile)
+    secret_path = "/usr/local/discord-twitch/secret.cfg"
+    logger.info(f"⚠️  Systemd Credential env not found. Trying local: {secret_path}")
+
+streamers_path = "/usr/local/discord-twitch/streamers.cfg"
+
+read_files = config.read([secret_path, streamers_path])
+
+if not read_files:
+    logger.error(f"❌ No config files found! Looked for: {secret_path}, {streamers_path}")
+    sys.exit(1)
+
+logger.info(f"✅ Config loaded from: {read_files}")
 
 # 1. DISCORD
 DISCORD_TOKEN = config['discord']['token']

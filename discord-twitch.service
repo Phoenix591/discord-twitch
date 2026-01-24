@@ -13,8 +13,6 @@ Group=discord-twitch
 
 # Run the script directly (Shebang handles the python path)
 ExecStart=/usr/local/discord-twitch/bot.py
-
-# Inject the secret.cfg securely
 LoadCredential=secret.cfg:/usr/local/discord-twitch/secret.cfg
 
 # =======================================================
