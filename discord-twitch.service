@@ -1,7 +1,7 @@
 [Unit]
 Description=Discord Twitch Webhook Bot
-After=network-online.target
-Wants=network-online.target
+After=network-online.target discord-twitch-updater.service
+Requires=network-online.target discord-twitch-updater.service
 
 [Service]
 # =======================================================
