@@ -175,28 +175,66 @@ class TwitchBot(twitchio.Client):
                 logger.error(f"   ❌ Failed {streamer_name}: {e}")
 
     async def event_stream_online(self, payload):
-        streamer_id = str(payload.broadcaster.id)
-        streamer_name = payload.broadcaster.name
+        """
+        Triggered when a subscribed streamer goes LIVE.
+        """
+        streamer_id = payload.broadcaster.id
+        streamer_login = payload.broadcaster.name
+        stream_url = f"https://twitch.tv/{streamer_login}"
 
-        logger.info(f"📣 WEBHOOK RECEIVED: {streamer_name} is LIVE")
+        logger.info(f"📣 WEBHOOK RECEIVED: {streamer_login} is LIVE")
 
-        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if not channel: return
-
-        embed = discord.Embed(
-            title=f"🔴 {streamer_name} is LIVE!",
-            url=f"https://twitch.tv/{streamer_name}",
-            color=0x9146FF
-        )
+        stream_title = "Live Stream"
+        game_name = "Unknown Category"
+        thumbnail_url = None
 
         try:
-            msg = await channel.send(
-                content=f"Hey @everyone, **{streamer_name}** is live!", 
-                embed=embed
-            )
-            active_messages[streamer_id] = msg
+            streams = await self.fetch_streams(user_ids=[streamer_id])
+            
+            if streams:
+                stream = streams[0]
+                stream_title = stream.title
+                game_name = stream.game_name
+                
+                thumb_asset = getattr(stream, "thumbnail", None) or getattr(stream, "thumbnail_url", None)
+                
+                if thumb_asset:
+                    if hasattr(thumb_asset, 'url_for'):
+                        thumbnail_url = thumb_asset.url_for(width=1280, height=720)
+                    else:
+                        # Fallback for strings (older versions)
+                        thumbnail_url = str(thumb_asset).replace("{width}x{height}", "1280x720")
+            
+            else:
+                logger.warning(f"   ⚠️ {streamer_login} is live, but API returned no stream data.")
+
         except Exception as e:
-            logger.error(f"Discord Send Error: {e}")
+            logger.error(f"   ⚠️ Could not fetch stream details: {e}")
+
+        embed = discord.Embed(
+            title=stream_title,
+            url=stream_url,
+            description=f"**{streamer_login}** is playing **{game_name}**!",
+            color=0x9146FF,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        
+        if thumbnail_url:
+            embed.set_image(url=thumbnail_url)
+
+        embed.set_footer(text="Twitch Notification")
+
+        # 4. Send to Discord
+        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        if channel:
+            try:
+                msg = await channel.send(content=f"🔴 **{streamer_login}** is LIVE! {stream_url}", embed=embed)
+                active_messages[streamer_id] = msg
+                logger.info(f"   ➜ Notification sent to Discord.")
+            except Exception as e:
+                logger.error(f"   ❌ Discord Send Failed: {e}")
+        else:
+            logger.error("   ❌ Discord Channel not found.")
 
     async def event_stream_offline(self, payload):
         streamer_id = str(payload.broadcaster.id)
