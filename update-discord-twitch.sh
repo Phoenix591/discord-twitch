@@ -107,7 +107,7 @@ fi
 # 9. CONDITIONAL RESTART
 if systemctl is-active --quiet discord-twitch; then
     echo "♻️  Bot active. Restarting..."
-    systemctl restart discord-twitch
+    systemctl restart --no-block discord-twitch
     echo "✅ Updated & Restarted ($LATEST_TAG)"
 else
     echo "✅ Updated ($LATEST_TAG). No restart required."
