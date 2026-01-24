@@ -6,13 +6,15 @@ set -e
 # CONFIGURATION
 # ==========================================
 REPO_URL="https://github.com/Phoenix591/discord-twitch"
-# UPDATED: Use S3 URI format
 S3_CONFIG_URI="s3://phoenix591/discord-twitch/streamers.cfg"
 
 INSTALL_DIR="/usr/local/discord-twitch"
 SERVICE_DIR="/etc/systemd/system"
 BACKUP_DIR="${INSTALL_DIR}/backups/$(date +%Y%m%d_%H%M%S)"
 DOWNLOAD_USER="nobody"
+
+# Self-Location for self-update check
+CURRENT_SCRIPT=$(realpath "$0")
 
 # 1. ROOT CHECK
 if [ "$EUID" -ne 0 ]; then
@@ -27,9 +29,9 @@ TEMP_DIR=$(mktemp -d)
 cleanup() {
     rm -rf "$TEMP_DIR"
 }
+# Trap ensures cleanup happens on exit (success or failure)
 trap cleanup EXIT
 
-# Setup permissions for the unprivileged git download
 chown $DOWNLOAD_USER "$TEMP_DIR"
 chmod 700 "$TEMP_DIR"
 
@@ -47,18 +49,44 @@ echo "🏷️  Downloading version: $LATEST_TAG"
 
 # 4. DOWNLOAD FILES
 
-# A. Download Repo Zip (As 'nobody' - Untrusted Internet Source)
+# A. Download Repo Zip (As 'nobody')
 ZIP_URL="$REPO_URL/archive/refs/tags/$LATEST_TAG.zip"
 sudo -u $DOWNLOAD_USER curl -fL -o "$TEMP_DIR/update.zip" "$ZIP_URL"
 sudo -u $DOWNLOAD_USER unzip -q "$TEMP_DIR/update.zip" -d "$TEMP_DIR/extracted"
 SOURCE_DIR=$(find "$TEMP_DIR/extracted" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 
-# B. Download Streamers Config (As ROOT - Trusted Private Source)
-# We run as root to ensure access to /root/.aws/ credentials
+# ==========================================
+# SELF-UPDATE LOGIC
+# ==========================================
+NEW_SCRIPT="$SOURCE_DIR/update-discord-twitch.sh"
+
+if [ -f "$NEW_SCRIPT" ]; then
+    if ! cmp -s "$CURRENT_SCRIPT" "$NEW_SCRIPT"; then
+        echo "✨ New updater version detected. Updating self..."
+        
+        install -d -m 755 "$BACKUP_DIR"
+        cp "$CURRENT_SCRIPT" "$BACKUP_DIR/update-discord-twitch.sh.bak"
+        
+        # Install new script
+        install -o root -g root -m 755 "$NEW_SCRIPT" "$CURRENT_SCRIPT"
+        
+        echo "🔁 Handing over control to new script..."
+        
+        # Explicitly clean up OUR temp dir before we vanish
+        rm -rf "$TEMP_DIR"
+        
+        # Replace current process with new script
+        # The new script will start fresh, run mktemp, and create its own new temp dir
+        exec "$CURRENT_SCRIPT"
+    fi
+fi
+# ==========================================
+
+# B. Download Streamers Config (As ROOT)
 echo "☁️  Fetching streamers.cfg from S3..."
 aws s3 cp "$S3_CONFIG_URI" "$TEMP_DIR/streamers.cfg" --quiet
 
-# 5. BACKUP
+# 5. BACKUP APP FILES
 echo "🗄️  Creating backup..."
 install -d -m 755 "$BACKUP_DIR"
 [ -f "$INSTALL_DIR/bot.py" ] && cp "$INSTALL_DIR/bot.py" "$BACKUP_DIR/"
@@ -100,7 +128,6 @@ done
 
 # 8. INSTALL STREAMERS CONFIG (From S3)
 S3_CFG_CHANGED=0
-# Ensure we downloaded something valid before comparing
 if [ -f "$TEMP_DIR/streamers.cfg" ]; then
     if ! cmp -s "$TEMP_DIR/streamers.cfg" "$INSTALL_DIR/streamers.cfg"; then
         echo "   ☁️  Updating streamers.cfg from S3"
@@ -119,7 +146,6 @@ fi
 
 # 10. CONDITIONAL RESTART
 if systemctl is-active --quiet discord-twitch; then
-    # Check if we updated code, config, OR git version
     CURRENT_VERSION=$(cat "$INSTALL_DIR/version.txt" 2>/dev/null || echo 'none')
     
     if [ $SERVICE_CHANGED -eq 1 ] || [ $S3_CFG_CHANGED -eq 1 ] || [ "$LATEST_TAG" != "$CURRENT_VERSION" ]; then
