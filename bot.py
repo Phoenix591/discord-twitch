@@ -10,6 +10,9 @@ import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("DiscordTwitchBot")
+
 config = configparser.ConfigParser()
 
 cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
