@@ -5,7 +5,8 @@ import discord
 import configparser
 import os
 import datetime
-from discord.ext import commands, tasks  # <--- NEW: Import tasks
+import sys
+from discord.ext import commands, tasks
 import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
