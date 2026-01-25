@@ -133,33 +133,24 @@ class TwitchBot(twitchio.Client):
             return
 
         try:
-            # Scan the last 50 messages (Adjust limit if your channel is very busy)
+            # Scan the last 50 messages
             async for message in channel.history(limit=50):
 
-                # 1. Ignore messages not by me
                 if message.author != discord_bot.user:
                     continue
 
-                # 2. Ignore messages without embeds
                 if not message.embeds:
                     continue
 
                 embed = message.embeds[0]
 
-                # 3. Check for the "Live" color (Purple: 0x9146FF -> Decimal: 9520895)
-                # If the embed is Grey (Offline), we ignore it.
+                # Purple color indicates a Live message
                 if embed.color and embed.color.value == 9520895:
-
-                    # 4. Extract Streamer Name from URL (https://twitch.tv/ninja)
                     if embed.url:
-                        # Get the last part of the URL (the login name)
                         login_name_from_url = embed.url.split('/')[-1].lower()
 
-                        # 5. Reverse Lookup: Find the ID for this name
-                        # We need the ID because `active_messages` keys are IDs (from Twitch events)
                         found_id = None
                         for s_id, s_name in STREAMERS_TO_TRACK.items():
-                            # Compare against config names (case-insensitive)
                             if s_name.lower() == login_name_from_url:
                                 found_id = s_id
                                 break
@@ -170,21 +161,40 @@ class TwitchBot(twitchio.Client):
 
         except Exception as e:
             logger.error(f"❌ Failed to rebuild cache: {e}")
-        logger.info(f"📋 Subscribing {len(STREAMERS_TO_TRACK)} channels...")
 
-        for streamer_id, streamer_name in STREAMERS_TO_TRACK.items():
-            try:
-                # Subscribe Online
-                online_sub = StreamOnlineSubscription(broadcaster_user_id=streamer_id, version="1")
-                await self.subscribe_webhook(payload=online_sub, callback_url=PUBLIC_URL)
+    # ---------------------------------------------------------------------
+    # Helper: Build Embed (Shared by initial send and retry)
+    # ---------------------------------------------------------------------
+    def build_embed(self, streamer_login, stream_url, stream_data=None):
+        title = "Live Stream"
+        game = "Unknown Category"
+        thumbnail_url = None
 
-                # Subscribe Offline
-                offline_sub = StreamOfflineSubscription(broadcaster_user_id=streamer_id, version="1")
-                await self.subscribe_webhook(payload=offline_sub, callback_url=PUBLIC_URL)
+        if stream_data:
+            title = stream_data.title
+            game = stream_data.game_name
+            
+            thumb_asset = getattr(stream_data, "thumbnail", None) or getattr(stream_data, "thumbnail_url", None)
+            
+            if thumb_asset:
+                if hasattr(thumb_asset, 'url_for'):
+                    thumbnail_url = thumb_asset.url_for(width=1280, height=720)
+                else:
+                    thumbnail_url = str(thumb_asset).replace("{width}x{height}", "1280x720")
 
-                logger.info(f"   ➜ Subscribed: {streamer_name} (ID: {streamer_id})")
-            except Exception as e:
-                logger.error(f"   ❌ Failed {streamer_name}: {e}")
+        embed = discord.Embed(
+            title=title,
+            url=stream_url,
+            description=f"**{streamer_login}** is playing **{game}**!",
+            color=0x9146FF,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        
+        if thumbnail_url:
+            embed.set_image(url=thumbnail_url)
+
+        embed.set_footer(text="Twitch Notification")
+        return embed
 
     async def event_stream_online(self, payload):
         """
@@ -196,57 +206,51 @@ class TwitchBot(twitchio.Client):
 
         logger.info(f"📣 WEBHOOK RECEIVED: {streamer_login} is LIVE")
 
-        stream_title = "Live Stream"
-        game_name = "Unknown Category"
-        thumbnail_url = None
-
+        # 1. First Attempt: Fetch Data
+        stream_data = None
         try:
             streams = await self.fetch_streams(user_ids=[streamer_id])
-            
             if streams:
-                stream = streams[0]
-                stream_title = stream.title
-                game_name = stream.game_name
-                
-                thumb_asset = getattr(stream, "thumbnail", None) or getattr(stream, "thumbnail_url", None)
-                
-                if thumb_asset:
-                    if hasattr(thumb_asset, 'url_for'):
-                        thumbnail_url = thumb_asset.url_for(width=1280, height=720)
-                    else:
-                        # Fallback for strings (older versions)
-                        thumbnail_url = str(thumb_asset).replace("{width}x{height}", "1280x720")
-            
+                stream_data = streams[0]
             else:
-                logger.warning(f"   ⚠️ {streamer_login} is live, but API returned no stream data.")
-
+                logger.warning(f"   ⚠️ {streamer_login} is live, but API returned no stream data (API Lag).")
         except Exception as e:
             logger.error(f"   ⚠️ Could not fetch stream details: {e}")
 
-        embed = discord.Embed(
-            title=stream_title,
-            url=stream_url,
-            description=f"**{streamer_login}** is playing **{game_name}**!",
-            color=0x9146FF,
-            timestamp=datetime.datetime.now(datetime.UTC)
-        )
-        
-        if thumbnail_url:
-            embed.set_image(url=thumbnail_url)
+        # 2. Build Initial Embed (Uses Defaults if stream_data is None)
+        embed = self.build_embed(streamer_login, stream_url, stream_data)
 
-        embed.set_footer(text="Twitch Notification")
-
-        # 4. Send to Discord
+        # 3. Send Notification Immediately
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if channel:
-            try:
-                msg = await channel.send(content=f"🔴 **{streamer_login}** is LIVE! {stream_url}", embed=embed)
-                active_messages[streamer_id] = msg
-                logger.info(f"   ➜ Notification sent to Discord.")
-            except Exception as e:
-                logger.error(f"   ❌ Discord Send Failed: {e}")
-        else:
+        if not channel:
             logger.error("   ❌ Discord Channel not found.")
+            return
+
+        try:
+            msg = await channel.send(content=f"🔴 **{streamer_login}** is LIVE! {stream_url}", embed=embed)
+            active_messages[streamer_id] = msg
+            logger.info(f"   ➜ Notification sent to Discord.")
+        except Exception as e:
+            logger.error(f"   ❌ Discord Send Failed: {e}")
+            return
+
+        # 4. Retry Logic (Only if initial fetch failed)
+        if not stream_data:
+            logger.info(f"   ⏳ API Lag detected. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+            
+            try:
+                streams = await self.fetch_streams(user_ids=[streamer_id])
+                if streams:
+                    logger.info(f"   ✅ Data found on retry! Updating message for {streamer_login}.")
+                    # Build new embed with the valid data
+                    new_embed = self.build_embed(streamer_login, stream_url, streams[0])
+                    # Edit the existing message
+                    await msg.edit(embed=new_embed)
+                else:
+                    logger.warning(f"   ❌ Still no data after 5s. Keeping default message.")
+            except Exception as e:
+                logger.error(f"   ❌ Retry failed: {e}")
 
     async def event_stream_offline(self, payload):
         streamer_id = str(payload.broadcaster.id)
@@ -274,26 +278,19 @@ class TwitchBot(twitchio.Client):
 
 twitch_bot = TwitchBot()
 
-
 # DEBUG LOOP
 @tasks.loop(seconds=DEBUG_INTERVAL)
 async def debug_status_check():
     try:
-        # 1. Get the wrapper object
         response = await twitch_bot.fetch_eventsub_subscriptions()
-
-        # 2. Flatten the async iterator into a standard list
-        # response.subscriptions is an HTTPAsyncIterator, so we must use [async for ...]
         current_subs = [s async for s in response.subscriptions]
 
         logger.info(f"🔎 DEBUG CHECK: Found {len(current_subs)} active subscriptions.")
 
         for sub in current_subs:
-            # Safely get the user_id from the condition dict
             user_id = sub.condition.get('broadcaster_user_id', 'Unknown')
             name = STREAMERS_TO_TRACK.get(user_id, f"ID_{user_id}")
 
-            # Create a clean status log
             status_icon = "⚠️"
             if sub.status == 'enabled':
                 status_icon = "✅"
@@ -309,14 +306,11 @@ async def debug_status_check():
 
 @debug_status_check.before_loop
 async def before_debug_loop():
-# Wait for the bot to be fully ready before asking for data
     await twitch_bot.wait_until_ready()
 
 @discord_bot.event
 async def setup_hook():
-    # Start the Twitch Client
     discord_bot.loop.create_task(twitch_bot.start())
-    # Start the Debug Loop
     debug_status_check.start()
 
 @discord_bot.command()
