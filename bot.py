@@ -4,8 +4,8 @@ import logging
 import discord
 import configparser
 import os
-import datetime
 import sys
+import datetime
 from discord.ext import commands, tasks
 import twitchio
 from twitchio.web import AiohttpAdapter
@@ -308,10 +308,74 @@ async def debug_status_check():
 async def before_debug_loop():
     await twitch_bot.wait_until_ready()
 
+# HOURLY SYNC (Garbage Collection / Refresh)
+@tasks.loop(hours=1)
+async def hourly_sync():
+    # Only run if there is something to check
+    if not active_messages:
+        return
+
+    logger.info("⏰ Starting Hourly Stream Sync...")
+
+    # We iterate over a copy of keys because we might delete items from the dict
+    for streamer_id in list(active_messages.keys()):
+        msg = active_messages[streamer_id]
+        
+        try:
+            streams = await twitch_bot.fetch_streams(user_ids=[streamer_id])
+            
+            if not streams:
+                # =================================================
+                # CASE 1: STREAMER IS OFFLINE (Silent/Missed Webhook)
+                # =================================================
+                logger.info(f"   📉 Detected Silent Offline for ID: {streamer_id}")
+                
+                # Resolve name from config or unknown
+                streamer_name = STREAMERS_TO_TRACK.get(streamer_id, "Unknown")
+                
+                timestamp = int(datetime.datetime.now().timestamp())
+                new_embed = discord.Embed(
+                    title=f"⚫ {streamer_name} was live.",
+                    description=f"Stream ended at <t:{timestamp}:T>.",
+                    url=f"https://twitch.tv/{streamer_name}",
+                    color=0x2c2f33
+                )
+                
+                try:
+                    await msg.edit(content=None, embed=new_embed)
+                except Exception:
+                    pass # Message might be deleted
+                
+                # Remove from cache
+                del active_messages[streamer_id]
+                
+            else:
+                # =================================================
+                # CASE 2: STREAMER IS LIVE (Update Info)
+                # =================================================
+                stream = streams[0]
+                # In TwitchIO v3, stream.user is a PartialUser, .name is the login
+                streamer_login = stream.user.name
+                stream_url = f"https://twitch.tv/{streamer_login}"
+                
+                logger.info(f"   🔄 Syncing data for {streamer_login}...")
+                
+                # Use our helper to build the fresh embed
+                new_embed = twitch_bot.build_embed(streamer_login, stream_url, stream)
+                
+                try:
+                    await msg.edit(embed=new_embed)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"   ❌ Sync failed for {streamer_id}: {e}")
+
 @discord_bot.event
 async def setup_hook():
     discord_bot.loop.create_task(twitch_bot.start())
     debug_status_check.start()
+    hourly_sync.start()
 
 @discord_bot.command()
 async def test(ctx):
