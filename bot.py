@@ -6,6 +6,7 @@ import configparser
 import os
 import sys
 import datetime
+from typing import Any
 from discord.ext import commands, tasks
 import twitchio
 from twitchio.web import AiohttpAdapter
@@ -86,7 +87,7 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 class TwitchBot(twitchio.Client):
-    def __init__(self):
+    def __init__(self) -> None:
         adapter = AiohttpAdapter(
             port=LOCAL_PORT,
             domain=SERVER_DOMAIN,
@@ -98,7 +99,7 @@ class TwitchBot(twitchio.Client):
             adapter=adapter,
         )
 
-    async def event_ready(self):
+    async def event_ready(self) -> None:
         logger.info(f"✅ Twitch Webhook Server listening on port {LOCAL_PORT}")
 
         await discord_bot.wait_until_ready()
@@ -133,7 +134,7 @@ class TwitchBot(twitchio.Client):
             except Exception as e:
                 logger.error(f"   ❌ Failed {streamer_name}: {e}")
 
-    async def populate_message_cache(self):
+    async def populate_message_cache(self) -> None:
         """
         Scans recent Discord messages to find active 'Live' alerts
         and restores them to memory so we can edit them later.
@@ -141,8 +142,10 @@ class TwitchBot(twitchio.Client):
         logger.info("🧠 Scanning Discord history to rebuild state...")
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
 
-        if not channel:
-            logger.error("❌ Cannot fetch history: Channel not found.")
+        if not isinstance(channel, discord.TextChannel):
+            logger.error(
+                "❌ Cannot fetch history: Channel not found or not a TextChannel."
+            )
             return
 
         try:
@@ -159,8 +162,9 @@ class TwitchBot(twitchio.Client):
 
                 # Purple color indicates a Live message
                 if embed.color and embed.color.value == 9520895:
-                    if embed.url:
-                        login_name_from_url = embed.url.split("/")[-1].lower()
+                    url = embed.url
+                    if url:
+                        login_name_from_url = url.split("/")[-1].lower()
 
                         found_id = None
                         for s_id, s_name in STREAMERS_TO_TRACK.items():
@@ -184,14 +188,20 @@ class TwitchBot(twitchio.Client):
     # ---------------------------------------------------------------------
     # Helper: Build Embed (Shared by initial send and retry)
     # ---------------------------------------------------------------------
-    def build_embed(self, streamer_login, stream_url, stream_data=None):
+    def build_embed(
+        self,
+        streamer_login: str,
+        stream_url: str,
+        stream_data: twitchio.Stream | None = None,
+    ) -> discord.Embed:
         title = "Live Stream"
         game = "Unknown Category"
         thumbnail_url = None
 
         if stream_data:
             title = stream_data.title
-            game = stream_data.game_name
+            # Fix: Handle None game_name by defaulting to "Unknown Category"
+            game = stream_data.game_name or "Unknown Category"
 
             thumb_asset = getattr(stream_data, "thumbnail", None) or getattr(
                 stream_data, "thumbnail_url", None
@@ -222,7 +232,7 @@ class TwitchBot(twitchio.Client):
     # ---------------------------------------------------------------------
     # Periodic Delayed Check (Recursively schedules itself)
     # ---------------------------------------------------------------------
-    async def delayed_check(self, streamer_id, streamer_login):
+    async def delayed_check(self, streamer_id: str, streamer_login: str) -> None:
         logger.info(f"   ⏳ Scheduling 1-hour health check for {streamer_login}...")
 
         # Wait 1 hour (3600 seconds)
@@ -236,7 +246,8 @@ class TwitchBot(twitchio.Client):
 
         try:
             msg = active_messages[streamer_id]
-            streams = await self.fetch_streams(user_ids=[streamer_id])
+            # TwitchIO v3: Consume async iterator into a list
+            streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
 
             if not streams:
                 # CASE 1: Silent Offline detected
@@ -264,9 +275,10 @@ class TwitchBot(twitchio.Client):
                     f"   🔄 Stream still live. Updating info for {streamer_login}..."
                 )
                 stream = streams[0]
-                stream_url = f"https://twitch.tv/{streamer_login}"
+                login_name = stream.user.name or "Unknown"
+                stream_url = f"https://twitch.tv/{login_name}"
 
-                new_embed = self.build_embed(streamer_login, stream_url, stream)
+                new_embed = self.build_embed(login_name, stream_url, stream)
 
                 try:
                     await msg.edit(embed=new_embed)
@@ -274,27 +286,28 @@ class TwitchBot(twitchio.Client):
                     pass
 
                 # RECURSIVE: Schedule the next check for 1 hour from now
-                asyncio.create_task(self.delayed_check(streamer_id, streamer_login))
+                asyncio.create_task(self.delayed_check(streamer_id, login_name))
 
         except Exception as e:
             logger.error(f"   ❌ Delayed check failed for {streamer_login}: {e}")
             # Optional: On error (e.g. API fail), try again in 1 hour anyway
             asyncio.create_task(self.delayed_check(streamer_id, streamer_login))
 
-    async def event_stream_online(self, payload):
+    async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
         """
         Triggered when a subscribed streamer goes LIVE.
         """
         streamer_id = payload.broadcaster.id
-        streamer_login = payload.broadcaster.name
+        streamer_login = payload.broadcaster.name or "Unknown"
         stream_url = f"https://twitch.tv/{streamer_login}"
 
         logger.info(f"📣 WEBHOOK RECEIVED: {streamer_login} is LIVE")
 
         # 1. First Attempt: Fetch Data
-        stream_data = None
+        stream_data: twitchio.Stream | None = None
         try:
-            streams = await self.fetch_streams(user_ids=[streamer_id])
+            # TwitchIO v3: Consume async iterator into a list
+            streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
             if streams:
                 stream_data = streams[0]
             else:
@@ -309,8 +322,8 @@ class TwitchBot(twitchio.Client):
 
         # 3. Send Notification Immediately
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if not channel:
-            logger.error("   ❌ Discord Channel not found.")
+        if not isinstance(channel, discord.TextChannel):
+            logger.error("   ❌ Discord Channel not found or not a TextChannel.")
             return
 
         try:
@@ -333,7 +346,8 @@ class TwitchBot(twitchio.Client):
             await asyncio.sleep(5)
 
             try:
-                streams = await self.fetch_streams(user_ids=[streamer_id])
+                # TwitchIO v3: Consume async iterator into a list
+                streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
                 if streams:
                     logger.info(
                         f"   ✅ Data found on retry! Updating message for {streamer_login}."
@@ -349,9 +363,9 @@ class TwitchBot(twitchio.Client):
             except Exception as e:
                 logger.error(f"   ❌ Retry failed: {e}")
 
-    async def event_stream_offline(self, payload):
+    async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
         streamer_id = str(payload.broadcaster.id)
-        streamer_name = payload.broadcaster.name
+        streamer_name = payload.broadcaster.name or "Unknown"
 
         logger.info(f"🌑 WEBHOOK RECEIVED: {streamer_name} is OFFLINE")
 
@@ -370,7 +384,7 @@ class TwitchBot(twitchio.Client):
                 pass
             del active_messages[streamer_id]
 
-    async def event_error(self, payload):
+    async def event_error(self, payload: twitchio.EventErrorPayload) -> None:
         logger.error(f"❌ Twitch Event Error: {payload.error}")
 
 
@@ -379,7 +393,7 @@ twitch_bot = TwitchBot()
 
 # DEBUG LOOP
 @tasks.loop(seconds=DEBUG_INTERVAL)
-async def debug_status_check():
+async def debug_status_check() -> None:
     try:
         response = await twitch_bot.fetch_eventsub_subscriptions()
         current_subs = [s async for s in response.subscriptions]
@@ -407,18 +421,18 @@ async def debug_status_check():
 
 
 @debug_status_check.before_loop
-async def before_debug_loop():
+async def before_debug_loop() -> None:
     await twitch_bot.wait_until_ready()
 
 
 @discord_bot.event
-async def setup_hook():
+async def setup_hook() -> None:
     discord_bot.loop.create_task(twitch_bot.start())
     debug_status_check.start()
 
 
 @discord_bot.command()
-async def test(ctx):
+async def test(ctx: commands.Context[Any]) -> None:
     await ctx.send("✅ System Normal.")
 
 
