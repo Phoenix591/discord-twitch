@@ -6,7 +6,8 @@ set -e
 # CONFIGURATION
 # ==========================================
 REPO_URL="https://github.com/Phoenix591/discord-twitch"
-S3_CONFIG_URI="s3://phoenix591/discord-twitch/streamers.cfg"
+S3_STREAMERS_URI="s3://phoenix591/discord-twitch/streamers.cfg"
+S3_SECRET_URI="s3://phoenix591/discord-twitch/secret.cfg"
 
 INSTALL_DIR="/usr/local/discord-twitch"
 SERVICE_DIR="/etc/systemd/system"
@@ -82,15 +83,17 @@ if [ -f "$NEW_SCRIPT" ]; then
 fi
 # ==========================================
 
-# B. Download Streamers Config (As ROOT)
-echo "☁️  Fetching streamers.cfg from S3..."
-aws s3 cp "$S3_CONFIG_URI" "$TEMP_DIR/streamers.cfg" --quiet
+# B. Download Configs (As ROOT)
+echo "☁️  Fetching configs from S3..."
+aws s3 cp "$S3_STREAMERS_URI" "$TEMP_DIR/streamers.cfg" --quiet
+aws s3 cp "$S3_SECRET_URI" "$TEMP_DIR/secret.cfg" --quiet
 
 # 5. BACKUP APP FILES
 echo "🗄️  Creating backup..."
 install -d -m 755 "$BACKUP_DIR"
 [ -f "$INSTALL_DIR/bot.py" ] && cp "$INSTALL_DIR/bot.py" "$BACKUP_DIR/"
 [ -f "$INSTALL_DIR/streamers.cfg" ] && cp "$INSTALL_DIR/streamers.cfg" "$BACKUP_DIR/"
+[ -f "$INSTALL_DIR/secret.cfg" ] && cp "$INSTALL_DIR/secret.cfg" "$BACKUP_DIR/"
 [ -f "$SERVICE_DIR/discord-twitch.service" ] && cp "$SERVICE_DIR/discord-twitch.service" "$BACKUP_DIR/"
 
 echo "🔄 Installing..."
@@ -126,8 +129,10 @@ find "$SOURCE_DIR" -type f \
     install -o root -g root -m $PERM "$file" "$INSTALL_DIR/$fname"
 done
 
-# 8. INSTALL STREAMERS CONFIG (From S3)
+# 8. INSTALL CONFIGS (From S3)
 S3_CFG_CHANGED=0
+
+# Streamers Config
 if [ -f "$TEMP_DIR/streamers.cfg" ]; then
     if ! cmp -s "$TEMP_DIR/streamers.cfg" "$INSTALL_DIR/streamers.cfg"; then
         echo "   ☁️  Updating streamers.cfg from S3"
@@ -135,6 +140,19 @@ if [ -f "$TEMP_DIR/streamers.cfg" ]; then
         S3_CFG_CHANGED=1
     else
         echo "   (Streamers list is unchanged)"
+    fi
+fi
+
+# Secret Config
+S3_SECRET_CHANGED=0
+if [ -f "$TEMP_DIR/secret.cfg" ]; then
+    if [ ! -f "$INSTALL_DIR/secret.cfg" ] || ! cmp -s "$TEMP_DIR/secret.cfg" "$INSTALL_DIR/secret.cfg"; then
+        echo "   🔒 Updating secret.cfg from S3"
+        # 600 permissions for secrets (Root R/W only)
+        install -o root -g root -m 600 "$TEMP_DIR/secret.cfg" "$INSTALL_DIR/secret.cfg"
+        S3_SECRET_CHANGED=1
+    else
+        echo "   (Secret config is unchanged)"
     fi
 fi
 
@@ -148,7 +166,8 @@ fi
 if systemctl is-active --quiet discord-twitch; then
     CURRENT_VERSION=$(cat "$INSTALL_DIR/version.txt" 2>/dev/null || echo 'none')
     
-    if [ $SERVICE_CHANGED -eq 1 ] || [ $S3_CFG_CHANGED -eq 1 ] || [ "$LATEST_TAG" != "$CURRENT_VERSION" ]; then
+    # Restart if Service, Streamers list, Secrets, or Bot Version changed
+    if [ $SERVICE_CHANGED -eq 1 ] || [ $S3_CFG_CHANGED -eq 1 ] || [ $S3_SECRET_CHANGED -eq 1 ] || [ "$LATEST_TAG" != "$CURRENT_VERSION" ]; then
         echo "♻️  Changes detected. Queuing Restart..."
         systemctl restart --no-block discord-twitch
         echo "$LATEST_TAG" > "$INSTALL_DIR/version.txt"
