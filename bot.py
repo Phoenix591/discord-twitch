@@ -88,7 +88,7 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 class TwitchBot(twitchio.Client):
     def __init__(self) -> None:
-        adapter = AiohttpAdapter(
+        adapter: AiohttpAdapter[Any] = AiohttpAdapter(
             port=LOCAL_PORT,
             domain=SERVER_DOMAIN,
             eventsub_secret=TWITCH_EVENTSUB_SECRET,
@@ -200,7 +200,6 @@ class TwitchBot(twitchio.Client):
 
         if stream_data:
             title = stream_data.title
-            # Fix: Handle None game_name by defaulting to "Unknown Category"
             game = stream_data.game_name or "Unknown Category"
 
             thumb_asset = getattr(stream_data, "thumbnail", None) or getattr(
