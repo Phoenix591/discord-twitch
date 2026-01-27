@@ -1,4 +1,4 @@
-#!/usr/local/discord-twitch/bin/python
+#!/usr/bin/env python
 import asyncio
 import logging
 import discord
