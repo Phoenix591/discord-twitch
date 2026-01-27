@@ -1,0 +1,19 @@
+[project]
+name = "discord-twitch-bot"
+description = "A Discord bot that sends notifications when Twitch streamers go live."
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "discord.py>=2.0.0",
+    "twitchio>=3.0.0",
+    "aiohttp>=3.7.4"
+]
+
+[project.scripts]
+discord-twitch = "discord_twitch.bot:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]

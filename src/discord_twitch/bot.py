@@ -19,15 +19,50 @@ logger = logging.getLogger("DiscordTwitchBot")
 
 config = configparser.ConfigParser()
 
+# ==========================================
+# CONFIGURATION LOADING
+# ==========================================
+# 1. Locate Secret Config
+# Priority: Systemd Creds -> /etc -> Local
+secret_path = None
 cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-if cred_dir:
-    secret_path = os.path.join(cred_dir, "secret.cfg")
-    logger.info(f"🔒 Loading secrets from Systemd Credential: {secret_path}")
-else:
-    secret_path = "/usr/local/discord-twitch/secret.cfg"
-    logger.info(f"⚠️  Systemd Credential env not found. Trying local: {secret_path}")
+secret_candidates = []
 
-streamers_path = "/usr/local/discord-twitch/streamers.cfg"
+if cred_dir:
+    secret_candidates.append(os.path.join(cred_dir, "secret.cfg"))
+
+secret_candidates.extend([
+    "/etc/discord-twitch/secret.cfg",
+    "/usr/local/discord-twitch/secret.cfg",
+    "secret.cfg"
+])
+
+for candidate in secret_candidates:
+    if os.path.exists(candidate):
+        secret_path = candidate
+        logger.info(f"🔒 Loading secrets from: {secret_path}")
+        break
+
+if not secret_path:
+    # Fallback to print error with expected path
+    secret_path = "/usr/local/discord-twitch/secret.cfg"
+    logger.info(f"⚠️  No secret config found. Trying default: {secret_path}")
+
+# 2. Locate Streamers Config
+streamers_path = None
+streamer_candidates = [
+    "/etc/discord-twitch/streamers.cfg",
+    "/usr/local/discord-twitch/streamers.cfg",
+    "streamers.cfg"
+]
+
+for candidate in streamer_candidates:
+    if os.path.exists(candidate):
+        streamers_path = candidate
+        break
+
+if not streamers_path:
+    streamers_path = "/usr/local/discord-twitch/streamers.cfg"
 
 read_files = config.read([secret_path, streamers_path])
 
@@ -435,5 +470,9 @@ async def test(ctx: commands.Context[Any]) -> None:
     await ctx.send("✅ System Normal.")
 
 
-if __name__ == "__main__":
+def main() -> None:
     discord_bot.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()

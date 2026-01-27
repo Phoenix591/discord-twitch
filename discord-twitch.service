@@ -4,16 +4,12 @@ After=network-online.target discord-twitch-updater.service
 Requires=network-online.target discord-twitch-updater.service
 
 [Service]
-# =======================================================
-# 1. IDENTITY & EXECUTION
-# =======================================================
 DynamicUser=yes
 User=discord-twitch
 Group=discord-twitch
 
-# Run the script directly (Shebang handles the python path)
 ExecStart=/usr/local/discord-twitch/bot.py
-LoadCredential=secret.cfg:/usr/local/discord-twitch/secret.cfg
+LoadCredential=secret.cfg:/etc/discord-twitch/secret.cfg
 
 # =======================================================
 # 2. STATELESS / EPHEMERAL ENV
