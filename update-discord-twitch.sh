@@ -6,9 +6,14 @@ set -e
 # CONFIGURATION
 # ==========================================
 REPO_URL="https://github.com/Phoenix591/discord-twitch"
-S3_STREAMERS_URI="s3://phoenix591/discord-twitch/streamers.cfg"
-S3_SECRET_URI="s3://phoenix591/discord-twitch/secret.cfg"
+S3_BUCKET_BASE="s3://phoenix591/discord-twitch"
 
+# Artifacts
+S3_ARTIFACT="$S3_BUCKET_BASE/discord-twitch.tar.xz"
+S3_STREAMERS="$S3_BUCKET_BASE/streamers.cfg"
+S3_SECRET="$S3_BUCKET_BASE/secret.cfg"
+
+# Local Paths
 INSTALL_DIR="/usr/local/discord-twitch"
 CONFIG_DIR="/etc/discord-twitch"
 SERVICE_DIR="/etc/systemd/system"
@@ -24,7 +29,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "🚀 Starting Full Update..."
+echo "🚀 Starting Full Update (S3 Source)..."
 
 # 2. PREPARE SANDBOX
 TEMP_DIR=$(mktemp -d)
@@ -39,7 +44,7 @@ chmod 700 "$TEMP_DIR"
 # Ensure Config Directory Exists
 install -d -m 755 "$CONFIG_DIR"
 
-# 3. IDENTIFY VERSION
+# 3. IDENTIFY TARGET VERSION (Using Git Remote Tags as 'Source of Truth')
 echo "🔍 Checking for latest tag..."
 LATEST_TAG_REF=$(cd "$TEMP_DIR" && sudo -u $DOWNLOAD_USER HOME="$TEMP_DIR" git ls-remote --tags --sort='v:refname' $REPO_URL.git | tail -n1 | awk '{print $2}')
 LATEST_TAG=${LATEST_TAG_REF##*/}
@@ -49,14 +54,34 @@ if [ -z "$LATEST_TAG" ]; then
     exit 1
 fi
 
-echo "🏷️  Downloading version: $LATEST_TAG"
+# Compare with installed version
+CURRENT_VERSION=$(cat "$INSTALL_DIR/version.txt" 2>/dev/null || echo 'none')
 
-# 4. DOWNLOAD FILES
-# A. Download Repo Zip
-ZIP_URL="$REPO_URL/archive/refs/tags/$LATEST_TAG.zip"
-sudo -u $DOWNLOAD_USER curl -fL -o "$TEMP_DIR/update.zip" "$ZIP_URL"
-sudo -u $DOWNLOAD_USER unzip -q "$TEMP_DIR/update.zip" -d "$TEMP_DIR/extracted"
+# Force download if versions mismatch OR if explicit forced update is needed
+# (You can remove the version check if you want it to ALWAYS download/reinstall)
+echo "🏷️  Latest: $LATEST_TAG | Current: $CURRENT_VERSION"
+
+# 4. DOWNLOAD ARTIFACTS (From S3)
+echo "☁️  Fetching application tarball from S3..."
+aws s3 cp "$S3_ARTIFACT" "$TEMP_DIR/update.tar.xz" --quiet
+
+echo "☁️  Fetching configs from S3..."
+aws s3 cp "$S3_STREAMERS" "$TEMP_DIR/streamers.cfg" --quiet
+aws s3 cp "$S3_SECRET" "$TEMP_DIR/secret.cfg" --quiet
+
+# Extract Application (As 'nobody' for safety)
+mkdir -p "$TEMP_DIR/extracted"
+chown $DOWNLOAD_USER "$TEMP_DIR/extracted"
+# Extract tar.xz
+sudo -u $DOWNLOAD_USER tar -xJf "$TEMP_DIR/update.tar.xz" -C "$TEMP_DIR/extracted"
+
+# Find the source directory (Since we used --prefix in git archive, it will be inside a subdir)
 SOURCE_DIR=$(find "$TEMP_DIR/extracted" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+
+if [ -z "$SOURCE_DIR" ]; then
+    echo "❌ Error: Could not find extracted source directory."
+    exit 1
+fi
 
 # ==========================================
 # SELF-UPDATE LOGIC
@@ -76,11 +101,6 @@ if [ -f "$NEW_SCRIPT" ]; then
 fi
 # ==========================================
 
-# B. Download Configs (From S3 to Temp)
-echo "☁️  Fetching configs from S3..."
-aws s3 cp "$S3_STREAMERS_URI" "$TEMP_DIR/streamers.cfg" --quiet
-aws s3 cp "$S3_SECRET_URI" "$TEMP_DIR/secret.cfg" --quiet
-
 # 5. BACKUP APP FILES
 echo "🗄️  Creating backup..."
 install -d -m 755 "$BACKUP_DIR"
@@ -96,8 +116,6 @@ SERVICE_CHANGED=0
 find "$SOURCE_DIR" -name "*.service" | while read -r service_file; do
     fname=$(basename "$service_file")
     target="$SERVICE_DIR/$fname"
-    
-    # We always install if different (updates LoadCredential path automatically)
     if ! cmp -s "$service_file" "$target"; then
         echo "   ⚙️  Updating service: $fname"
         install -o root -g root -m 644 "$service_file" "$target"
@@ -147,8 +165,7 @@ fi
 
 # 10. CONDITIONAL RESTART
 if systemctl is-active --quiet discord-twitch; then
-    CURRENT_VERSION=$(cat "$INSTALL_DIR/version.txt" 2>/dev/null || echo 'none')
-    
+    # Restart if Service, Streamers, Secrets, or Version changed
     if [ $SERVICE_CHANGED -eq 1 ] || [ $S3_CFG_CHANGED -eq 1 ] || [ $S3_SECRET_CHANGED -eq 1 ] || [ "$LATEST_TAG" != "$CURRENT_VERSION" ]; then
         echo "♻️  Changes detected. Queuing Restart..."
         systemctl restart --no-block discord-twitch
