@@ -6,473 +6,354 @@ import configparser
 import os
 import sys
 import datetime
+import json
+import signal
+import subprocess
+import xml.etree.ElementTree as ET
 from typing import Any
+from aiohttp import web
 from discord.ext import commands, tasks
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("DiscordTwitchBot")
-
+# Setup & Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger("Bot")
 config = configparser.ConfigParser()
+config.optionxform = str
 
-# ==========================================
-# CONFIGURATION LOADING
-# ==========================================
-# 1. Locate Secret Config
-# Priority: Systemd Creds -> /etc -> Local
-secret_path = None
+# Configuration Loading
 cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+secret_path = None
 secret_candidates = []
-
 if cred_dir:
     secret_candidates.append(os.path.join(cred_dir, "secret.cfg"))
-
-secret_candidates.extend([
-    "/etc/discord-twitch/secret.cfg",
-    "/usr/local/discord-twitch/secret.cfg",
-    "secret.cfg"
-])
+secret_candidates.extend(["/etc/discord-twitch/secret.cfg", "/usr/local/discord-twitch/secret.cfg", "secret.cfg"])
 
 for candidate in secret_candidates:
     if os.path.exists(candidate):
         secret_path = candidate
         logger.info(f"🔒 Loading secrets from: {secret_path}")
         break
-
 if not secret_path:
-    # Fallback to print error with expected path
     secret_path = "/usr/local/discord-twitch/secret.cfg"
-    logger.info(f"⚠️  No secret config found. Trying default: {secret_path}")
 
-# 2. Locate Streamers Config
 streamers_path = None
-streamer_candidates = [
-    "/etc/discord-twitch/streamers.cfg",
-    "/usr/local/discord-twitch/streamers.cfg",
-    "streamers.cfg"
-]
-
+streamer_candidates = ["/etc/discord-twitch/streamers.cfg", "/usr/local/discord-twitch/streamers.cfg", "streamers.cfg"]
 for candidate in streamer_candidates:
     if os.path.exists(candidate):
         streamers_path = candidate
         break
-
 if not streamers_path:
     streamers_path = "/usr/local/discord-twitch/streamers.cfg"
 
-read_files = config.read([secret_path, streamers_path])
-
-if not read_files:
-    logger.error(
-        f"❌ No config files found! Looked for: {secret_path}, {streamers_path}"
-    )
+if not config.read([secret_path, streamers_path]):
+    logger.error("❌ No config files found!")
     sys.exit(1)
 
-logger.info(f"✅ Config loaded from: {read_files}")
-
-# 1. DISCORD
+# Constants & Config Parsing
 DISCORD_TOKEN = config["discord"]["token"]
 DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
-
-# 2. TWITCH
 TWITCH_CLIENT_ID = config["twitch"]["clientid"]
 TWITCH_CLIENT_SECRET = config["twitch"]["clientsecret"]
 TWITCH_EVENTSUB_SECRET = config["twitch"]["eventsub_secret"]
-
-# 3. SERVER
+YOUTUBE_API_KEY = config["youtube"].get("api_key", "") if "youtube" in config else ""
+S3_BUCKET_URL = config["server"].get("s3_state_url", "s3://phoenix591/discord-twitch/state.json")
 SERVER_DOMAIN = config["server"]["domain"]
 PUBLIC_URL = config["server"]["public_url"]
 LOCAL_PORT = int(config["server"]["port"])
-DEBUG_INTERVAL = int(config["server"].get("debug_interval", 30))
 
-# 4. STREAMERS
-STREAMERS_TO_TRACK = {}
+TWITCH_STREAMERS = {}
+YOUTUBE_STREAMERS = {}
 if "streamers" in config:
-    for streamer_id, display_name in config["streamers"].items():
-        STREAMERS_TO_TRACK[str(streamer_id)] = display_name
+    logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
+    for s_id, s_name in config["streamers"].items():
+        TWITCH_STREAMERS[str(s_id)] = s_name
+if "twitch" in config:
+    for s_id, s_name in config["twitch"].items():
+        TWITCH_STREAMERS[str(s_id)] = s_name
+if "youtube" in config:
+    for c_id, c_name in config["youtube"].items():
+        if c_id != "api_key":
+            YOUTUBE_STREAMERS[str(c_id)] = c_name
 
-# ==========================================
-#           GLOBAL STATE & LOGGING
-# ==========================================
+# State & Scheduler
+twitch_active_messages = {}
+STATE_FILE = "state.json"
+scheduler = AsyncIOScheduler()
 
-active_messages = {}
+def sync_state_from_s3():
+    try:
+        logger.info("☁️  Downloading state from S3...")
+        subprocess.run(["aws", "s3", "cp", S3_BUCKET_URL, STATE_FILE], check=True, timeout=10)
+    except Exception as e:
+        logger.warning(f"⚠️  Could not download state (First run?): {e}")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("Bot")
+def sync_state_to_s3():
+    try:
+        save_local_state()
+        subprocess.run(["aws", "s3", "cp", STATE_FILE, S3_BUCKET_URL], check=False)
+        logger.info("☁️  State synced to S3.")
+    except Exception as e:
+        logger.error(f"❌ S3 Sync failed: {e}")
 
-# ==========================================
-#              DISCORD BOT SETUP
-# ==========================================
+def save_local_state():
+    jobs = []
+    for job in scheduler.get_jobs():
+        if job.id.startswith("yt_"):
+            jobs.append({"video_id": job.args[0], "scheduled_time": job.args[1].isoformat()})
+    with open(STATE_FILE, "w") as f:
+        json.dump({"pending_checks": jobs}, f)
 
+def load_local_state(bot_instance):
+    if not os.path.exists(STATE_FILE): return
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for item in data.get("pending_checks", []):
+            vid = item["video_id"]
+            s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
+            run_date = s_time - datetime.timedelta(minutes=3)
+            if run_date < now:
+                run_date = now + datetime.timedelta(seconds=5)
+            scheduler.add_job(bot_instance.check_youtube_status, 'date', run_date=run_date, args=[vid, s_time], id=f"yt_{vid}", replace_existing=True)
+        logger.info("♻️  Restored pending YouTube checks.")
+    except Exception as e:
+        logger.error(f"❌ Failed to load state: {e}")
+
+# Discord Bot Setup
 intents = discord.Intents.default()
 intents.message_content = True
 discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ==========================================
-#              TWITCH BOT
-# ==========================================
-
-
-class TwitchBot(twitchio.Client):
+# Main Hybrid Bot Class
+class HybridBot(twitchio.Client):
     def __init__(self) -> None:
-        adapter: AiohttpAdapter[Any] = AiohttpAdapter(
-            port=LOCAL_PORT,
-            domain=SERVER_DOMAIN,
-            eventsub_secret=TWITCH_EVENTSUB_SECRET,
-        )
-        super().__init__(
-            client_id=TWITCH_CLIENT_ID,
-            client_secret=TWITCH_CLIENT_SECRET,
-            adapter=adapter,
-        )
+        self.adapter = AiohttpAdapter(port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
+        super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.adapter)
 
     async def event_ready(self) -> None:
-        logger.info(f"✅ Twitch Webhook Server listening on port {LOCAL_PORT}")
-
+        logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
         await discord_bot.wait_until_ready()
         await self.populate_message_cache()
-        # -----------------------------------------------
+        sync_state_from_s3()
+        load_local_state(self)
+        scheduler.start()
+        await self.setup_twitch_subs()
+        if hasattr(self.adapter, '_app') and self.adapter._app:
+            self.adapter._app.router.add_post('/youtube', self.youtube_webhook_handler)
+            self.adapter._app.router.add_get('/youtube', self.youtube_webhook_handler)
+        asyncio.create_task(self.maintain_youtube_subs())
 
-        # Cleanup old subs
+    # YouTube Logic
+    async def youtube_webhook_handler(self, request):
+        if request.method == 'GET':
+            challenge = request.query.get('hub.challenge')
+            return web.Response(text=challenge) if challenge else web.Response(status=404)
+        try:
+            xml_text = await request.text()
+            root = ET.fromstring(xml_text)
+            ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
+            entry = root.find('atom:entry', ns)
+            if entry:
+                video_id = entry.find('yt:videoId', ns).text
+                channel_id = entry.find('yt:channelId', ns).text
+                if channel_id in YOUTUBE_STREAMERS:
+                    asyncio.create_task(self.initial_youtube_check(video_id))
+        except Exception as e:
+            logger.error(f"YouTube XML Parse Error: {e}")
+        return web.Response(text="OK")
+
+    async def initial_youtube_check(self, video_id):
+        data = await self.fetch_youtube_data(video_id)
+        if not data: return
+        snippet = data['snippet']
+        live_details = data.get('liveStreamingDetails', {})
+        is_live = snippet.get('liveBroadcastContent') == 'live'
+        scheduled_start = live_details.get('scheduledStartTime')
+
+        if is_live:
+            await self.send_youtube_notification(data)
+            self.remove_youtube_job(video_id)
+        elif scheduled_start:
+            dt = datetime.datetime.fromisoformat(scheduled_start.replace('Z', '+00:00'))
+            logger.info(f"   🗓️ Scheduled for {dt}. Queueing Sniper.")
+            run_time = dt - datetime.timedelta(minutes=3)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if run_time < now:
+                run_time = now + datetime.timedelta(seconds=10)
+            scheduler.add_job(self.check_youtube_status, 'date', run_date=run_time, args=[video_id, dt], id=f"yt_{video_id}", replace_existing=True)
+            sync_state_to_s3()
+
+    async def check_youtube_status(self, video_id, scheduled_time):
+        data = await self.fetch_youtube_data(video_id)
+        if not data: return
+        is_live = data['snippet'].get('liveBroadcastContent') == 'live'
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        if is_live:
+            logger.info(f"🎯 Sniper Hit! {video_id} is LIVE.")
+            await self.send_youtube_notification(data)
+            return
+        
+        if now < (scheduled_time + datetime.timedelta(minutes=3)):
+            next_run = now + datetime.timedelta(seconds=90)
+            scheduler.add_job(self.check_youtube_status, 'date', run_date=next_run, args=[video_id, scheduled_time], id=f"yt_{video_id}")
+        elif now < (scheduled_time + datetime.timedelta(minutes=21)):
+            next_run = now + datetime.timedelta(minutes=3)
+            scheduler.add_job(self.check_youtube_status, 'date', run_date=next_run, args=[video_id, scheduled_time], id=f"yt_{video_id}")
+        else:
+            logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
+            sync_state_to_s3()
+
+    async def fetch_youtube_data(self, video_id):
+        if not YOUTUBE_API_KEY: return None
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {"part": "snippet,liveStreamingDetails", "id": video_id, "key": YOUTUBE_API_KEY}
+        async with self.adapter._session.get(url, params=params) as resp:
+            if resp.status != 200: return None
+            js = await resp.json()
+            return js['items'][0] if js['items'] else None
+
+    async def send_youtube_notification(self, data):
+        channel_id = data['snippet']['channelId']
+        channel_name = YOUTUBE_STREAMERS.get(channel_id, data['snippet']['channelTitle'])
+        vid_id = data['id']
+        url = f"https://www.youtube.com/watch?v={vid_id}"
+        embed = discord.Embed(title=data['snippet']['title'], url=url, description=f"**{channel_name}** is LIVE on YouTube!", color=0xFF0000, timestamp=datetime.datetime.now(datetime.timezone.utc))
+        embed.set_image(url=data['snippet']['thumbnails']['maxres']['url'] if 'maxres' in data['snippet']['thumbnails'] else data['snippet']['thumbnails']['high']['url'])
+        chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        if chan: await chan.send(content=f"🔴 **{channel_name}** is LIVE! {url}", embed=embed)
+
+    def remove_youtube_job(self, video_id):
+        job_id = f"yt_{video_id}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            sync_state_to_s3()
+
+    async def maintain_youtube_subs(self):
+        await discord_bot.wait_until_ready()
+        hub_url = "https://pubsubhubbub.appspot.com/subscribe"
+        while not self.is_closed:
+            logger.info("📡 Renewing YouTube WebSub Leases...")
+            for cid in YOUTUBE_STREAMERS:
+                data = {"hub.mode": "subscribe", "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}", "hub.callback": f"{PUBLIC_URL}/youtube", "hub.lease_seconds": 432000}
+                try:
+                    async with self.adapter._session.post(hub_url, data=data) as resp:
+                        if resp.status >= 400: logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
+                except Exception as e:
+                    logger.error(f"   ❌ Failed sub for {cid}: {e}")
+            await asyncio.sleep(345600)
+
+    # Twitch Logic
+    async def setup_twitch_subs(self):
         try:
             await self.delete_all_eventsub_subscriptions()
-        except Exception:
-            pass
-
-        logger.info(f"📋 Subscribing {len(STREAMERS_TO_TRACK)} channels...")
-
-        for streamer_id, streamer_name in STREAMERS_TO_TRACK.items():
+        except: pass
+        logger.info(f"📋 Subscribing {len(TWITCH_STREAMERS)} Twitch channels...")
+        for s_id, s_name in TWITCH_STREAMERS.items():
             try:
-                # Online
-                online_sub = StreamOnlineSubscription(
-                    broadcaster_user_id=streamer_id, version="1"
-                )
-                await self.subscribe_webhook(
-                    payload=online_sub, callback_url=PUBLIC_URL
-                )
-                # Offline
-                offline_sub = StreamOfflineSubscription(
-                    broadcaster_user_id=streamer_id, version="1"
-                )
-                await self.subscribe_webhook(
-                    payload=offline_sub, callback_url=PUBLIC_URL
-                )
-                logger.info(f"   ➜ Subscribed: {streamer_name} (ID: {streamer_id})")
+                await self.subscribe_webhook(payload=StreamOnlineSubscription(broadcaster_user_id=s_id, version="1"), callback_url=PUBLIC_URL)
+                await self.subscribe_webhook(payload=StreamOfflineSubscription(broadcaster_user_id=s_id, version="1"), callback_url=PUBLIC_URL)
             except Exception as e:
-                logger.error(f"   ❌ Failed {streamer_name}: {e}")
+                logger.error(f"   ❌ Failed Twitch {s_name}: {e}")
 
     async def populate_message_cache(self) -> None:
-        """
-        Scans recent Discord messages to find active 'Live' alerts
-        and restores them to memory so we can edit them later.
-        """
-        logger.info("🧠 Scanning Discord history to rebuild state...")
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-
-        if not isinstance(channel, discord.TextChannel):
-            logger.error(
-                "❌ Cannot fetch history: Channel not found or not a TextChannel."
-            )
-            return
-
+        if not isinstance(channel, discord.TextChannel): return
         try:
-            # Scan the last 50 messages
             async for message in channel.history(limit=50):
-
-                if message.author != discord_bot.user:
-                    continue
-
-                if not message.embeds:
-                    continue
-
+                if message.author != discord_bot.user or not message.embeds: continue
                 embed = message.embeds[0]
-
-                # Purple color indicates a Live message
                 if embed.color and embed.color.value == 9520895:
                     url = embed.url
                     if url:
-                        login_name_from_url = url.split("/")[-1].lower()
-
-                        found_id = None
-                        for s_id, s_name in STREAMERS_TO_TRACK.items():
-                            if s_name.lower() == login_name_from_url:
-                                found_id = s_id
-                                break
-
+                        login = url.split("/")[-1].lower()
+                        found_id = next((i for i, n in TWITCH_STREAMERS.items() if n.lower() == login), None)
                         if found_id:
-                            active_messages[found_id] = message
-                            logger.info(
-                                f"   ↳ ♻️  Restored state for: {login_name_from_url} (ID: {found_id})"
-                            )
-                            # Schedule a health check for this restored stream
-                            asyncio.create_task(
-                                self.delayed_check(found_id, login_name_from_url)
-                            )
-
+                            twitch_active_messages[found_id] = message
+                            asyncio.create_task(self.delayed_check(found_id, login))
         except Exception as e:
-            logger.error(f"❌ Failed to rebuild cache: {e}")
-
-    # ---------------------------------------------------------------------
-    # Helper: Build Embed (Shared by initial send and retry)
-    # ---------------------------------------------------------------------
-    def build_embed(
-        self,
-        streamer_login: str,
-        stream_url: str,
-        stream_data: twitchio.Stream | None = None,
-    ) -> discord.Embed:
-        title = "Live Stream"
-        game = "Unknown Category"
-        thumbnail_url = None
-
-        if stream_data:
-            title = stream_data.title
-            game = stream_data.game_name or "Unknown Category"
-
-            thumb_asset = getattr(stream_data, "thumbnail", None) or getattr(
-                stream_data, "thumbnail_url", None
-            )
-
-            if thumb_asset:
-                if hasattr(thumb_asset, "url_for"):
-                    thumbnail_url = thumb_asset.url_for(width=1280, height=720)
-                else:
-                    thumbnail_url = str(thumb_asset).replace(
-                        "{width}x{height}", "1280x720"
-                    )
-
-        embed = discord.Embed(
-            title=title,
-            url=stream_url,
-            description=f"**{streamer_login}** is playing **{game}**!",
-            color=0x9146FF,
-            timestamp=datetime.datetime.now(datetime.UTC),
-        )
-
-        if thumbnail_url:
-            embed.set_image(url=thumbnail_url)
-
-        embed.set_footer(text="Twitch Notification")
-        return embed
-
-    # ---------------------------------------------------------------------
-    # Periodic Delayed Check (Recursively schedules itself)
-    # ---------------------------------------------------------------------
-    async def delayed_check(self, streamer_id: str, streamer_login: str) -> None:
-        logger.info(f"   ⏳ Scheduling 1-hour health check for {streamer_login}...")
-
-        # Wait 1 hour (3600 seconds)
-        await asyncio.sleep(3600)
-
-        # If stream was manually ended/offline'd during the wait, stop.
-        if streamer_id not in active_messages:
-            return
-
-        logger.info(f"   ⏰ Performing 1-hour check for {streamer_login}...")
-
-        try:
-            msg = active_messages[streamer_id]
-            # TwitchIO v3: Consume async iterator into a list
-            streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
-
-            if not streams:
-                # CASE 1: Silent Offline detected
-                logger.info(f"   📉 Detected Silent Offline for {streamer_login}")
-
-                timestamp = int(datetime.datetime.now().timestamp())
-                new_embed = discord.Embed(
-                    title=f"⚫ {streamer_login} was live.",
-                    description=f"Stream ended at <t:{timestamp}:T>.",
-                    url=f"https://twitch.tv/{streamer_login}",
-                    color=0x2C2F33,
-                )
-
-                try:
-                    await msg.edit(content=None, embed=new_embed)
-                except Exception:
-                    pass
-
-                if streamer_id in active_messages:
-                    del active_messages[streamer_id]
-
-            else:
-                # CASE 2: Still Live (Update Info)
-                logger.info(
-                    f"   🔄 Stream still live. Updating info for {streamer_login}..."
-                )
-                stream = streams[0]
-                login_name = stream.user.name or "Unknown"
-                stream_url = f"https://twitch.tv/{login_name}"
-
-                new_embed = self.build_embed(login_name, stream_url, stream)
-
-                try:
-                    await msg.edit(embed=new_embed)
-                except Exception:
-                    pass
-
-                # RECURSIVE: Schedule the next check for 1 hour from now
-                asyncio.create_task(self.delayed_check(streamer_id, login_name))
-
-        except Exception as e:
-            logger.error(f"   ❌ Delayed check failed for {streamer_login}: {e}")
-            # Optional: On error (e.g. API fail), try again in 1 hour anyway
-            asyncio.create_task(self.delayed_check(streamer_id, streamer_login))
+            logger.error(f"❌ Cache rebuild fail: {e}")
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
-        """
-        Triggered when a subscribed streamer goes LIVE.
-        """
-        streamer_id = payload.broadcaster.id
-        streamer_login = payload.broadcaster.name or "Unknown"
-        stream_url = f"https://twitch.tv/{streamer_login}"
-
-        logger.info(f"📣 WEBHOOK RECEIVED: {streamer_login} is LIVE")
-
-        # 1. First Attempt: Fetch Data
-        stream_data: twitchio.Stream | None = None
+        s_id = payload.broadcaster.id
+        s_login = payload.broadcaster.name
+        logger.info(f"📣 Twitch LIVE: {s_login}")
+        stream_data = None
         try:
-            # TwitchIO v3: Consume async iterator into a list
-            streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
-            if streams:
-                stream_data = streams[0]
-            else:
-                logger.warning(
-                    f"   ⚠️ {streamer_login} is live, but API returned no stream data (API Lag)."
-                )
-        except Exception as e:
-            logger.error(f"   ⚠️ Could not fetch stream details: {e}")
-
-        # 2. Build Initial Embed (Uses Defaults if stream_data is None)
-        embed = self.build_embed(streamer_login, stream_url, stream_data)
-
-        # 3. Send Notification Immediately
-        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            logger.error("   ❌ Discord Channel not found or not a TextChannel.")
-            return
-
-        try:
-            msg = await channel.send(
-                content=f"🔴 **{streamer_login}** is LIVE! {stream_url}", embed=embed
-            )
-            active_messages[streamer_id] = msg
-            logger.info(f"   ➜ Notification sent to Discord.")
-
-            # 5. Schedule 1-Hour Health Check
-            asyncio.create_task(self.delayed_check(streamer_id, streamer_login))
-
-        except Exception as e:
-            logger.error(f"   ❌ Discord Send Failed: {e}")
-            return
-
-        # 4. Retry Logic (Only if initial fetch failed)
-        if not stream_data:
-            logger.info(f"   ⏳ API Lag detected. Retrying in 5 seconds...")
-            await asyncio.sleep(5)
-
-            try:
-                # TwitchIO v3: Consume async iterator into a list
-                streams = [s async for s in self.fetch_streams(user_ids=[streamer_id])]
-                if streams:
-                    logger.info(
-                        f"   ✅ Data found on retry! Updating message for {streamer_login}."
-                    )
-                    # Build new embed with the valid data
-                    new_embed = self.build_embed(streamer_login, stream_url, streams[0])
-                    # Edit the existing message
-                    await msg.edit(embed=new_embed)
-                else:
-                    logger.warning(
-                        f"   ❌ Still no data after 5s. Keeping default message."
-                    )
-            except Exception as e:
-                logger.error(f"   ❌ Retry failed: {e}")
+            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+            if streams: stream_data = streams[0]
+        except: pass
+        embed = self.build_twitch_embed(s_login, stream_data)
+        chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        if chan:
+            msg = await chan.send(content=f"🔴 **{s_login}** is LIVE! https://twitch.tv/{s_login}", embed=embed)
+            twitch_active_messages[s_id] = msg
+            asyncio.create_task(self.delayed_check(s_id, s_login))
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
-        streamer_id = str(payload.broadcaster.id)
-        streamer_name = payload.broadcaster.name or "Unknown"
-
-        logger.info(f"🌑 WEBHOOK RECEIVED: {streamer_name} is OFFLINE")
-
-        if streamer_id in active_messages:
-            old_msg = active_messages[streamer_id]
+        s_id = str(payload.broadcaster.id)
+        if s_id in twitch_active_messages:
             try:
-                timestamp = int(datetime.datetime.now().timestamp())
-                new_embed = discord.Embed(
-                    title=f"⚫ {streamer_name} was live.",
-                    description=f"Stream ended at <t:{timestamp}:T>.",
-                    url=f"https://twitch.tv/{streamer_name}",
-                    color=0x2C2F33,
-                )
-                await old_msg.edit(content=None, embed=new_embed)
-            except Exception:
-                pass
-            del active_messages[streamer_id]
+                ts = int(datetime.datetime.now().timestamp())
+                embed = discord.Embed(title=f"⚫ {payload.broadcaster.name} ended.", description=f"Ended at <t:{ts}:T>.", color=0x2C2F33)
+                await twitch_active_messages[s_id].edit(content=None, embed=embed)
+            except: pass
+            del twitch_active_messages[s_id]
 
-    async def event_error(self, payload: twitchio.EventErrorPayload) -> None:
-        logger.error(f"❌ Twitch Event Error: {payload.error}")
+    async def delayed_check(self, s_id: str, s_login: str) -> None:
+        await asyncio.sleep(3600)
+        if s_id not in twitch_active_messages: return
+        try:
+            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+            if not streams:
+                ts = int(datetime.datetime.now().timestamp())
+                embed = discord.Embed(title=f"⚫ {s_login} ended.", description=f"Ended at <t:{ts}:T>.", color=0x2C2F33)
+                await twitch_active_messages[s_id].edit(content=None, embed=embed)
+                del twitch_active_messages[s_id]
+            else:
+                await twitch_active_messages[s_id].edit(embed=self.build_twitch_embed(s_login, streams[0]))
+                asyncio.create_task(self.delayed_check(s_id, s_login))
+        except:
+            asyncio.create_task(self.delayed_check(s_id, s_login))
 
+    def build_twitch_embed(self, login, data):
+        title = data.title if data else "Live Stream"
+        game = data.game_name if data else "Unknown"
+        embed = discord.Embed(title=title, url=f"https://twitch.tv/{login}", description=f"**{login}** playing **{game}**", color=0x9146FF, timestamp=datetime.datetime.now(datetime.timezone.utc))
+        if data: embed.set_image(url=data.thumbnail_url.replace("{width}x{height}", "1280x720"))
+        return embed
 
-twitch_bot = TwitchBot()
+# Run & Lifecycle
+twitch_bot = HybridBot()
 
-
-# DEBUG LOOP
-@tasks.loop(seconds=DEBUG_INTERVAL)
-async def debug_status_check() -> None:
-    try:
-        response = await twitch_bot.fetch_eventsub_subscriptions()
-        current_subs = [s async for s in response.subscriptions]
-
-        logger.info(f"🔎 DEBUG CHECK: Found {len(current_subs)} active subscriptions.")
-
-        for sub in current_subs:
-            user_id = sub.condition.get("broadcaster_user_id", "Unknown")
-            name = STREAMERS_TO_TRACK.get(user_id, f"ID_{user_id}")
-
-            status_icon = "⚠️"
-            if sub.status == "enabled":
-                status_icon = "✅"
-            elif sub.status == "webhook_callback_verification_pending":
-                status_icon = "⏳"
-            elif sub.status == "webhook_callback_verification_failed":
-                status_icon = "❌"
-
-            logger.info(
-                f"   {status_icon} {name} | Type: {sub.type} | Status: {sub.status}"
-            )
-
-    except Exception as e:
-        logger.error(f"❌ Debug Loop Error: {e}")
-
-
-@debug_status_check.before_loop
-async def before_debug_loop() -> None:
-    await twitch_bot.wait_until_ready()
-
+@tasks.loop(minutes=90)
+async def autosave_state_task():
+    sync_state_to_s3()
 
 @discord_bot.event
 async def setup_hook() -> None:
     discord_bot.loop.create_task(twitch_bot.start())
-    debug_status_check.start()
+    autosave_state_task.start()
 
-
-@discord_bot.command()
-async def test(ctx: commands.Context[Any]) -> None:
-    await ctx.send("✅ System Normal.")
-
+async def shutdown_handler(signal_type):
+    logger.info(f"🛑 Received {signal_type.name}...")
+    sync_state_to_s3()
+    await discord_bot.close()
+    await twitch_bot.close()
 
 def main() -> None:
-    discord_bot.run(DISCORD_TOKEN)
-
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown_handler(s)))
+    try:
+        discord_bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt: pass
 
 if __name__ == "__main__":
     main()
