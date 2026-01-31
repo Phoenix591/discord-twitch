@@ -61,6 +61,7 @@ TWITCH_CLIENT_ID = config["twitch"]["clientid"]
 TWITCH_CLIENT_SECRET = config["twitch"]["clientsecret"]
 TWITCH_EVENTSUB_SECRET = config["twitch"]["eventsub_secret"]
 YOUTUBE_API_KEY = config["youtube"].get("api_key", "") if "youtube" in config else ""
+YOUTUBE_BACKFILL_CHECK = int(config["youtube"].get("backfill_check", 2)) if "youtube" in config else 2
 S3_BUCKET_URL = config["server"].get("s3_state_url", "s3://phoenix591/discord-twitch/state.json")
 SERVER_DOMAIN = config["server"]["domain"]
 PUBLIC_URL = config["server"]["public_url"]
@@ -79,7 +80,7 @@ if "twitch" in config:
         TWITCH_STREAMERS[str(s_id)] = s_name
 if "youtube" in config:
     for c_id, c_name in config["youtube"].items():
-        if c_id != "api_key":
+        if c_id not in ["api_key", "backfill_check"]:
             YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 # State & Scheduler
@@ -141,14 +142,12 @@ class HybridBot(twitchio.Client):
         self.session = None
         super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
         
-        # Register routes directly on the adapter (which IS the web app in v3)
-        path = urlparse(PUBLIC_URL).path.rstrip('/')
-        route = path + '/youtube'
-        
-        # In TwitchIO v3, the adapter inherits from web.Application, so we use .router directly
-        self.web_adapter.router.add_post(route, self.youtube_webhook_handler)
-        self.web_adapter.router.add_get(route, self.youtube_webhook_handler)
-        logger.info(f"✅ Registered YouTube Route: {route}")
+        if hasattr(self.web_adapter, 'router'):
+            path = urlparse(PUBLIC_URL).path.rstrip('/')
+            route = path + '/youtube'
+            self.web_adapter.router.add_post(route, self.youtube_webhook_handler)
+            self.web_adapter.router.add_get(route, self.youtube_webhook_handler)
+            logger.info(f"✅ Registered YouTube Route: {route}")
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
@@ -159,6 +158,7 @@ class HybridBot(twitchio.Client):
         load_local_state(self)
         scheduler.start()
         await self.setup_twitch_subs()
+        await self.run_youtube_backfill()
         asyncio.create_task(self.maintain_youtube_subs())
 
     async def close(self):
@@ -185,7 +185,30 @@ class HybridBot(twitchio.Client):
             logger.error(f"YouTube XML Parse Error: {e}")
         return web.Response(text="OK")
 
-    async def initial_youtube_check(self, video_id):
+    async def run_youtube_backfill(self):
+        logger.info(f"🔎 Backfilling YouTube State from RSS (limit {YOUTUBE_BACKFILL_CHECK})...")
+        tasks = []
+        for channel_id in YOUTUBE_STREAMERS:
+            try:
+                url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+                async with self.session.get(url) as resp:
+                    if resp.status != 200: continue
+                    xml_text = await resp.text()
+                
+                root = ET.fromstring(xml_text)
+                ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
+                
+                for entry in root.findall('atom:entry', ns)[:YOUTUBE_BACKFILL_CHECK]:
+                    vid = entry.find('yt:videoId', ns).text
+                    tasks.append(self.initial_youtube_check(vid, save=False))
+            except Exception as e:
+                logger.warning(f"   ⚠️ Backfill error for {channel_id}: {e}")
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+            sync_state_to_s3()
+
+    async def initial_youtube_check(self, video_id, save=True):
         data = await self.fetch_youtube_data(video_id)
         if not data: return
         snippet = data['snippet']
@@ -195,7 +218,7 @@ class HybridBot(twitchio.Client):
 
         if is_live:
             await self.send_youtube_notification(data)
-            self.remove_youtube_job(video_id)
+            self.remove_youtube_job(video_id, save)
         elif scheduled_start:
             dt = datetime.datetime.fromisoformat(scheduled_start.replace('Z', '+00:00'))
             logger.info(f"   🗓️ Scheduled for {dt}. Queueing Sniper.")
@@ -204,7 +227,7 @@ class HybridBot(twitchio.Client):
             if run_time < now:
                 run_time = now + datetime.timedelta(seconds=10)
             scheduler.add_job(self.check_youtube_status, 'date', run_date=run_time, args=[video_id, dt], id=f"yt_{video_id}", replace_existing=True)
-            sync_state_to_s3()
+            if save: sync_state_to_s3()
 
     async def check_youtube_status(self, video_id, scheduled_time):
         data = await self.fetch_youtube_data(video_id)
@@ -263,11 +286,11 @@ class HybridBot(twitchio.Client):
         chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
         if chan: await chan.send(content=f"{title_prefix} **{channel_name}** is LIVE! {url}", embed=embed)
 
-    def remove_youtube_job(self, video_id):
+    def remove_youtube_job(self, video_id, save=True):
         job_id = f"yt_{video_id}"
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
-            sync_state_to_s3()
+            if save: sync_state_to_s3()
 
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
