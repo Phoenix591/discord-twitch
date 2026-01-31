@@ -87,14 +87,16 @@ scheduler = AsyncIOScheduler()
 def sync_state_from_s3():
     try:
         logger.info("☁️  Downloading state from S3...")
-        subprocess.run(["aws", "s3", "cp", S3_BUCKET_URL, STATE_FILE], check=True, timeout=10)
+        env = {**os.environ, "HOME": "/tmp"}
+        subprocess.run(["aws", "s3", "cp", S3_BUCKET_URL, STATE_FILE], check=True, timeout=10, env=env)
     except Exception as e:
         logger.warning(f"⚠️  Could not download state (First run?): {e}")
 
 def sync_state_to_s3():
     try:
         save_local_state()
-        subprocess.run(["aws", "s3", "cp", STATE_FILE, S3_BUCKET_URL], check=False)
+        env = {**os.environ, "HOME": "/tmp"}
+        subprocess.run(["aws", "s3", "cp", STATE_FILE, S3_BUCKET_URL], check=False, env=env)
         logger.info("☁️  State synced to S3.")
     except Exception as e:
         logger.error(f"❌ S3 Sync failed: {e}")
@@ -132,8 +134,8 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
-        adapter = AiohttpAdapter(port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
-        super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=adapter)
+        self.web_adapter = AiohttpAdapter(port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
+        super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
@@ -143,9 +145,9 @@ class HybridBot(twitchio.Client):
         load_local_state(self)
         scheduler.start()
         await self.setup_twitch_subs()
-        if hasattr(self.adapter, '_app') and self.adapter._app:
-            self.adapter._app.router.add_post('/youtube', self.youtube_webhook_handler)
-            self.adapter._app.router.add_get('/youtube', self.youtube_webhook_handler)
+        if hasattr(self.web_adapter, '_app') and self.web_adapter._app:
+            self.web_adapter._app.router.add_post('/youtube', self.youtube_webhook_handler)
+            self.web_adapter._app.router.add_get('/youtube', self.youtube_webhook_handler)
         asyncio.create_task(self.maintain_youtube_subs())
 
     # YouTube Logic
@@ -213,7 +215,7 @@ class HybridBot(twitchio.Client):
         if not YOUTUBE_API_KEY: return None
         url = "https://www.googleapis.com/youtube/v3/videos"
         params = {"part": "snippet,liveStreamingDetails,statistics", "id": video_id, "key": YOUTUBE_API_KEY}
-        async with self.adapter._session.get(url, params=params) as resp:
+        async with self.web_adapter._session.get(url, params=params) as resp:
             if resp.status != 200: return None
             js = await resp.json()
             return js['items'][0] if js['items'] else None
@@ -253,12 +255,12 @@ class HybridBot(twitchio.Client):
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
         hub_url = "https://pubsubhubbub.appspot.com/subscribe"
-        while not self.is_closed:
+        while not discord_bot.is_closed():
             logger.info("📡 Renewing YouTube WebSub Leases...")
             for cid in YOUTUBE_STREAMERS:
                 data = {"hub.mode": "subscribe", "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}", "hub.callback": f"{PUBLIC_URL}/youtube", "hub.lease_seconds": 432000}
                 try:
-                    async with self.adapter._session.post(hub_url, data=data) as resp:
+                    async with self.web_adapter._session.post(hub_url, data=data) as resp:
                         if resp.status >= 400: logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
                 except Exception as e:
                     logger.error(f"   ❌ Failed sub for {cid}: {e}")
