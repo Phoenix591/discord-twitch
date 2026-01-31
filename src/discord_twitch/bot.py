@@ -140,6 +140,14 @@ class HybridBot(twitchio.Client):
         self.web_adapter = AiohttpAdapter(port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
         self.session = None
         super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
+        
+        # Register routes IMMEDIATELY in __init__, before server start
+        if hasattr(self.web_adapter, '_app') and self.web_adapter._app:
+            path = urlparse(PUBLIC_URL).path.rstrip('/')
+            route = path + '/youtube'
+            self.web_adapter._app.router.add_post(route, self.youtube_webhook_handler)
+            self.web_adapter._app.router.add_get(route, self.youtube_webhook_handler)
+            logger.info(f"✅ Registered YouTube Route: {route}")
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
@@ -150,16 +158,6 @@ class HybridBot(twitchio.Client):
         load_local_state(self)
         scheduler.start()
         await self.setup_twitch_subs()
-        
-        # FIX: Register route based on PUBLIC_URL path (e.g., /callback/youtube)
-        if hasattr(self.web_adapter, '_app') and self.web_adapter._app:
-            path = urlparse(PUBLIC_URL).path.rstrip('/')
-            route = path + '/youtube'
-            
-            self.web_adapter._app.router.add_post(route, self.youtube_webhook_handler)
-            self.web_adapter._app.router.add_get(route, self.youtube_webhook_handler)
-            logger.info(f"✅ Registered YouTube Route: {route}")
-            
         asyncio.create_task(self.maintain_youtube_subs())
 
     async def close(self):
@@ -280,7 +278,10 @@ class HybridBot(twitchio.Client):
                 try:
                     if self.session:
                         async with self.session.post(hub_url, data=data) as resp:
-                            if resp.status >= 400: logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
+                            if resp.status >= 400:
+                                logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
+                            else:
+                                logger.info(f"   ➜ Subscribed to YouTube: {YOUTUBE_STREAMERS[cid]} ({cid})")
                 except Exception as e:
                     logger.error(f"   ❌ Failed sub for {cid}: {e}")
             await asyncio.sleep(345600)
@@ -295,6 +296,7 @@ class HybridBot(twitchio.Client):
             try:
                 await self.subscribe_webhook(payload=StreamOnlineSubscription(broadcaster_user_id=s_id, version="1"), callback_url=PUBLIC_URL)
                 await self.subscribe_webhook(payload=StreamOfflineSubscription(broadcaster_user_id=s_id, version="1"), callback_url=PUBLIC_URL)
+                logger.info(f"   ➜ Subscribed to Twitch: {s_name}")
             except Exception as e:
                 logger.error(f"   ❌ Failed Twitch {s_name}: {e}")
 
