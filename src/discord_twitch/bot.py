@@ -212,7 +212,7 @@ class HybridBot(twitchio.Client):
     async def fetch_youtube_data(self, video_id):
         if not YOUTUBE_API_KEY: return None
         url = "https://www.googleapis.com/youtube/v3/videos"
-        params = {"part": "snippet,liveStreamingDetails", "id": video_id, "key": YOUTUBE_API_KEY}
+        params = {"part": "snippet,liveStreamingDetails,statistics", "id": video_id, "key": YOUTUBE_API_KEY}
         async with self.adapter._session.get(url, params=params) as resp:
             if resp.status != 200: return None
             js = await resp.json()
@@ -223,10 +223,26 @@ class HybridBot(twitchio.Client):
         channel_name = YOUTUBE_STREAMERS.get(channel_id, data['snippet']['channelTitle'])
         vid_id = data['id']
         url = f"https://www.youtube.com/watch?v={vid_id}"
-        embed = discord.Embed(title=data['snippet']['title'], url=url, description=f"**{channel_name}** is LIVE on YouTube!", color=0xFF0000, timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.set_image(url=data['snippet']['thumbnails']['maxres']['url'] if 'maxres' in data['snippet']['thumbnails'] else data['snippet']['thumbnails']['high']['url'])
+        
+        stats = data.get('statistics', {})
+        is_members_only = 'viewCount' not in stats
+
+        if is_members_only:
+            title_prefix = "( MEMBERS ONLY )"
+            desc = f"🔒 **{channel_name}** is live for **MEMBERS ONLY**!"
+            color = 0xFFD700 # Gold
+        else:
+            title_prefix = "🔴"
+            desc = f"**{channel_name}** is LIVE on YouTube!"
+            color = 0xFF0000 # Red
+
+        embed = discord.Embed(title=f"{title_prefix} {data['snippet']['title']}", url=url, description=desc, color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
+        thumbs = data['snippet']['thumbnails']
+        thumb_url = thumbs.get('maxres', thumbs.get('high', thumbs.get('default')))['url']
+        embed.set_image(url=thumb_url)
+
         chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if chan: await chan.send(content=f"🔴 **{channel_name}** is LIVE! {url}", embed=embed)
+        if chan: await chan.send(content=f"{title_prefix} **{channel_name}** is LIVE! {url}", embed=embed)
 
     def remove_youtube_job(self, video_id):
         job_id = f"yt_{video_id}"
