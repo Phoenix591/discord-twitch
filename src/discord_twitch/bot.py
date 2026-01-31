@@ -186,39 +186,67 @@ class HybridBot(twitchio.Client):
         return web.Response(text="OK")
 
     async def run_youtube_backfill(self):
-        logger.info(f"🔎 Backfilling YouTube State from Uploads Playlist (limit {YOUTUBE_BACKFILL_CHECK})...")
+        logger.info(f"🔎 Backfilling YouTube State (limit {YOUTUBE_BACKFILL_CHECK})...")
         if not YOUTUBE_API_KEY:
             logger.warning("   ⚠️ No API Key found. Skipping Backfill.")
             return
 
         tasks = []
-        for channel_id in YOUTUBE_STREAMERS:
-            # Convert Channel ID (UC...) to Uploads Playlist ID (UU...)
-            if channel_id.startswith("UC"):
-                playlist_id = "UU" + channel_id[2:]
-            else:
-                logger.warning(f"   ⚠️ Cannot derive playlist for {channel_id}, skipping.")
-                continue
+        # Spoof UA to prevent 403 on RSS
+        rss_headers = {"User-Agent": "Mozilla/5.0 (compatible; DiscordTwitchBot/2.0; +http://discordapp.com)"}
 
+        for channel_id in YOUTUBE_STREAMERS:
+            success = False
+            # Method 1: API (Get Uploads ID -> Get Items)
             try:
-                url = "https://www.googleapis.com/youtube/v3/playlistItems"
-                params = {
-                    "part": "contentDetails",
-                    "playlistId": playlist_id,
-                    "maxResults": YOUTUBE_BACKFILL_CHECK,
-                    "key": YOUTUBE_API_KEY
-                }
-                async with self.session.get(url, params=params) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"   ⚠️ Backfill API error for {channel_id}: {resp.status}")
-                        continue
-                    
-                    data = await resp.json()
-                    for item in data.get('items', []):
-                        vid = item['contentDetails']['videoId']
-                        tasks.append(self.initial_youtube_check(vid, save=False))
+                # Step 1: Get correct Uploads Playlist ID
+                url_chan = "https://www.googleapis.com/youtube/v3/channels"
+                params_chan = {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
+                async with self.session.get(url_chan, params=params_chan) as resp_chan:
+                    if resp_chan.status == 200:
+                        data_chan = await resp_chan.json()
+                        if data_chan.get('items'):
+                            playlist_id = data_chan['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+                            
+                            # Step 2: Get Playlist Items
+                            url_pli = "https://www.googleapis.com/youtube/v3/playlistItems"
+                            params_pli = {
+                                "part": "contentDetails", 
+                                "playlistId": playlist_id, 
+                                "maxResults": YOUTUBE_BACKFILL_CHECK, 
+                                "key": YOUTUBE_API_KEY
+                            }
+                            async with self.session.get(url_pli, params=params_pli) as resp_pli:
+                                if resp_pli.status == 200:
+                                    data_pli = await resp_pli.json()
+                                    for item in data_pli.get('items', []):
+                                        vid = item['contentDetails']['videoId']
+                                        tasks.append(self.initial_youtube_check(vid, save=False))
+                                    success = True
+                                else:
+                                    logger.warning(f"   ⚠️ PlaylistItems failed for {channel_id}: {resp_pli.status}")
+                    else:
+                        logger.warning(f"   ⚠️ Channel lookup failed for {channel_id}: {resp_chan.status}")
             except Exception as e:
-                logger.warning(f"   ⚠️ Backfill error for {channel_id}: {e}")
+                logger.debug(f"   ⚠️ API Backfill exc for {channel_id}: {e}")
+
+            # Method 2: Fallback to RSS with Spoofed UA
+            if not success:
+                try:
+                    url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+                    async with self.session.get(url, headers=rss_headers) as resp:
+                        if resp.status == 200:
+                            xml_text = await resp.text()
+                            root = ET.fromstring(xml_text)
+                            ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
+                            for entry in root.findall('atom:entry', ns)[:YOUTUBE_BACKFILL_CHECK]:
+                                vid_elem = entry.find('yt:videoId', ns)
+                                if vid_elem is not None and vid_elem.text:
+                                    tasks.append(self.initial_youtube_check(vid_elem.text, save=False))
+                        else:
+                            logger.warning(f"   ❌ RSS Backfill failed for {channel_id}: {resp.status}")
+                except Exception as e:
+                    logger.warning(f"   ❌ RSS Backfill exc for {channel_id}: {e}")
         
         if tasks:
             await asyncio.gather(*tasks)
