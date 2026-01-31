@@ -10,6 +10,7 @@ import json
 import signal
 import subprocess
 import socket
+import traceback
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from typing import Any
@@ -23,71 +24,98 @@ from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscriptio
 # Setup & Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("Bot")
+
+# Define global variables to be populated in main()
 config = configparser.ConfigParser()
 config.optionxform = str
-
-# Configuration Loading
-cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-secret_path = None
-secret_candidates = []
-if cred_dir:
-    secret_candidates.append(os.path.join(cred_dir, "secret.cfg"))
-secret_candidates.extend(["/etc/discord-twitch/secret.cfg", "/usr/local/discord-twitch/secret.cfg", "secret.cfg"])
-
-for candidate in secret_candidates:
-    if os.path.exists(candidate):
-        secret_path = candidate
-        logger.info(f"🔒 Loading secrets from: {secret_path}")
-        break
-if not secret_path:
-    secret_path = "/usr/local/discord-twitch/secret.cfg"
-
-streamers_path = None
-streamer_candidates = ["/etc/discord-twitch/streamers.cfg", "/usr/local/discord-twitch/streamers.cfg", "streamers.cfg"]
-for candidate in streamer_candidates:
-    if os.path.exists(candidate):
-        streamers_path = candidate
-        break
-if not streamers_path:
-    streamers_path = "/usr/local/discord-twitch/streamers.cfg"
-
-if not config.read([secret_path, streamers_path]):
-    logger.error("❌ No config files found!")
-    sys.exit(1)
-
-# Constants & Config Parsing
-DISCORD_TOKEN = config["discord"]["token"]
-DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
-TWITCH_CLIENT_ID = config["twitch"]["clientid"]
-TWITCH_CLIENT_SECRET = config["twitch"]["clientsecret"]
-TWITCH_EVENTSUB_SECRET = config["twitch"]["eventsub_secret"]
-YOUTUBE_API_KEY = config["youtube"].get("api_key", "") if "youtube" in config else ""
-YOUTUBE_BACKFILL_CHECK = int(config["youtube"].get("backfill_check", 2)) if "youtube" in config else 2
-S3_BUCKET_URL = config["server"].get("s3_state_url", "s3://phoenix591/discord-twitch/state.json")
-SERVER_DOMAIN = config["server"]["domain"]
-PUBLIC_URL = config["server"]["public_url"]
-LOCAL_PORT = int(config["server"]["port"])
-
-TWITCH_STREAMERS = {}
-YOUTUBE_STREAMERS = {}
-if "streamers" in config:
-    logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
-    for s_id, s_name in config["streamers"].items():
-        TWITCH_STREAMERS[str(s_id)] = s_name
-if "twitch" in config:
-    ignore_keys = ["clientid", "clientsecret", "eventsub_secret"]
-    for s_id, s_name in config["twitch"].items():
-        if s_id.lower() in ignore_keys: continue
-        TWITCH_STREAMERS[str(s_id)] = s_name
-if "youtube" in config:
-    for c_id, c_name in config["youtube"].items():
-        if c_id not in ["api_key", "backfill_check"]:
-            YOUTUBE_STREAMERS[str(c_id)] = c_name
-
-# State & Scheduler
+twitch_bot = None
 twitch_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
+
+# Global Placeholders for Config
+DISCORD_TOKEN = ""
+DISCORD_CHANNEL_ID = 0
+TWITCH_CLIENT_ID = ""
+TWITCH_CLIENT_SECRET = ""
+TWITCH_EVENTSUB_SECRET = ""
+YOUTUBE_API_KEY = ""
+YOUTUBE_BACKFILL_CHECK = 2
+S3_BUCKET_URL = ""
+SERVER_DOMAIN = ""
+PUBLIC_URL = ""
+LOCAL_PORT = 8080
+TWITCH_STREAMERS = {}
+YOUTUBE_STREAMERS = {}
+
+# Discord Bot Setup (Must be global for decorators)
+intents = discord.Intents.default()
+intents.message_content = True
+discord_bot = commands.Bot(command_prefix="!", intents=intents)
+
+def load_config():
+    global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
+    global TWITCH_EVENTSUB_SECRET, YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
+    global S3_BUCKET_URL, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
+    global TWITCH_STREAMERS, YOUTUBE_STREAMERS
+
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    secret_path = None
+    secret_candidates = []
+    if cred_dir:
+        secret_candidates.append(os.path.join(cred_dir, "secret.cfg"))
+    secret_candidates.extend(["/etc/discord-twitch/secret.cfg", "/usr/local/discord-twitch/secret.cfg", "secret.cfg"])
+
+    for candidate in secret_candidates:
+        if os.path.exists(candidate):
+            secret_path = candidate
+            logger.info(f"🔒 Loading secrets from: {secret_path}")
+            break
+    if not secret_path:
+        # Fallback for logging purposes, config.read will fail safely
+        secret_path = "secret.cfg"
+
+    streamers_path = None
+    streamer_candidates = ["/etc/discord-twitch/streamers.cfg", "/usr/local/discord-twitch/streamers.cfg", "streamers.cfg"]
+    for candidate in streamer_candidates:
+        if os.path.exists(candidate):
+            streamers_path = candidate
+            break
+    
+    files_to_read = [f for f in [secret_path, streamers_path] if f and os.path.exists(f)]
+    if not files_to_read:
+        raise FileNotFoundError("❌ No config files found!")
+
+    if not config.read(files_to_read):
+        raise FileNotFoundError("❌ Failed to parse config files.")
+
+    # Parse Constants
+    DISCORD_TOKEN = config["discord"]["token"]
+    DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
+    TWITCH_CLIENT_ID = config["twitch"]["clientid"]
+    TWITCH_CLIENT_SECRET = config["twitch"]["clientsecret"]
+    TWITCH_EVENTSUB_SECRET = config["twitch"]["eventsub_secret"]
+    YOUTUBE_API_KEY = config["youtube"].get("api_key", "") if "youtube" in config else ""
+    YOUTUBE_BACKFILL_CHECK = int(config["youtube"].get("backfill_check", 2)) if "youtube" in config else 2
+    S3_BUCKET_URL = config["server"].get("s3_state_url", "s3://phoenix591/discord-twitch/state.json")
+    SERVER_DOMAIN = config["server"]["domain"]
+    PUBLIC_URL = config["server"]["public_url"]
+    LOCAL_PORT = int(config["server"]["port"])
+
+    # Parse Streamers
+    if "streamers" in config:
+        logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
+        for s_id, s_name in config["streamers"].items():
+            TWITCH_STREAMERS[str(s_id)] = s_name
+    if "twitch" in config:
+        ignore_keys = ["clientid", "clientsecret", "eventsub_secret"]
+        for s_id, s_name in config["twitch"].items():
+            if s_id.lower() in ignore_keys: continue
+            TWITCH_STREAMERS[str(s_id)] = s_name
+    if "youtube" in config:
+        for c_id, c_name in config["youtube"].items():
+            if c_id not in ["api_key", "backfill_check"]:
+                YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 def sync_state_from_s3():
     try:
@@ -130,11 +158,6 @@ def load_local_state(bot_instance):
         logger.info("♻️  Restored pending YouTube checks.")
     except Exception as e:
         logger.error(f"❌ Failed to load state: {e}")
-
-# Discord Bot Setup
-intents = discord.Intents.default()
-intents.message_content = True
-discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
@@ -386,4 +409,108 @@ class HybridBot(twitchio.Client):
                 logger.error(f"   ❌ Failed Twitch {s_name}: {e}")
 
     async def populate_message_cache(self) -> None:
-        channel
+        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel): return
+        try:
+            async for message in channel.history(limit=50):
+                if message.author != discord_bot.user or not message.embeds: continue
+                embed = message.embeds[0]
+                if embed.color and embed.color.value == 9520895:
+                    url = embed.url
+                    if url:
+                        login = url.split("/")[-1].lower()
+                        found_id = next((i for i, n in TWITCH_STREAMERS.items() if n.lower() == login), None)
+                        if found_id:
+                            twitch_active_messages[found_id] = message
+                            asyncio.create_task(self.delayed_check(found_id, login))
+        except Exception as e:
+            logger.error(f"❌ Cache rebuild fail: {e}")
+
+    async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
+        s_id = payload.broadcaster.id
+        s_login = payload.broadcaster.name
+        logger.info(f"📣 Twitch LIVE: {s_login}")
+        stream_data = None
+        try:
+            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+            if streams: stream_data = streams[0]
+        except: pass
+        embed = self.build_twitch_embed(s_login, stream_data)
+        chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        if chan:
+            msg = await chan.send(content=f"🔴 **{s_login}** is LIVE! https://twitch.tv/{s_login}", embed=embed)
+            twitch_active_messages[s_id] = msg
+            asyncio.create_task(self.delayed_check(s_id, s_login))
+
+    async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
+        s_id = str(payload.broadcaster.id)
+        if s_id in twitch_active_messages:
+            try:
+                ts = int(datetime.datetime.now().timestamp())
+                embed = discord.Embed(title=f"⚫ {payload.broadcaster.name} ended.", description=f"Ended at <t:{ts}:T>.", color=0x2C2F33)
+                await twitch_active_messages[s_id].edit(content=None, embed=embed)
+            except: pass
+            del twitch_active_messages[s_id]
+
+    async def delayed_check(self, s_id: str, s_login: str) -> None:
+        await asyncio.sleep(3600)
+        if s_id not in twitch_active_messages: return
+        try:
+            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+            if not streams:
+                ts = int(datetime.datetime.now().timestamp())
+                embed = discord.Embed(title=f"⚫ {s_login} ended.", description=f"Ended at <t:{ts}:T>.", color=0x2C2F33)
+                await twitch_active_messages[s_id].edit(content=None, embed=embed)
+                del twitch_active_messages[s_id]
+            else:
+                await twitch_active_messages[s_id].edit(embed=self.build_twitch_embed(s_login, streams[0]))
+                asyncio.create_task(self.delayed_check(s_id, s_login))
+        except:
+            asyncio.create_task(self.delayed_check(s_id, s_login))
+
+    def build_twitch_embed(self, login, data):
+        title = data.title if data else "Live Stream"
+        game = data.game_name if data else "Unknown"
+        embed = discord.Embed(title=title, url=f"https://twitch.tv/{login}", description=f"**{login}** playing **{game}**", color=0x9146FF, timestamp=datetime.datetime.now(datetime.timezone.utc))
+        if data: embed.set_image(url=data.thumbnail_url.replace("{width}x{height}", "1280x720"))
+        return embed
+
+@tasks.loop(minutes=90)
+async def autosave_state_task():
+    sync_state_to_s3()
+
+@discord_bot.event
+async def setup_hook() -> None:
+    # Important: Initialize twitch_bot only if config loaded successfully
+    if twitch_bot:
+        discord_bot.loop.create_task(twitch_bot.start())
+    autosave_state_task.start()
+
+async def shutdown_handler(signal_type):
+    logger.info(f"🛑 Received {signal_type.name}...")
+    sync_state_to_s3()
+    await discord_bot.close()
+    if twitch_bot:
+        await twitch_bot.close()
+
+def main() -> None:
+    global twitch_bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown_handler(s)))
+    
+    try:
+        load_config()
+        twitch_bot = HybridBot()
+        discord_bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        # Catch init errors that cause "silent" death
+        logger.critical(f"🔥 FATAL ERROR: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
