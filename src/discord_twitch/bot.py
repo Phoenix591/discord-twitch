@@ -21,11 +21,19 @@ import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
 
+# Import boto3 for S3 access
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    print("❌ Critical: 'boto3' is missing. Please run: pip install boto3")
+    sys.exit(1)
+
 # Setup & Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("Bot")
 
-# Define global variables to be populated in main()
+# Global Variables
 config = configparser.ConfigParser()
 config.optionxform = str
 twitch_bot = None
@@ -33,7 +41,7 @@ twitch_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
 
-# Global Placeholders for Config
+# Config Placeholders
 DISCORD_TOKEN = ""
 DISCORD_CHANNEL_ID = 0
 TWITCH_CLIENT_ID = ""
@@ -48,7 +56,7 @@ LOCAL_PORT = 8080
 TWITCH_STREAMERS = {}
 YOUTUBE_STREAMERS = {}
 
-# Discord Bot Setup (Must be global for decorators)
+# Discord Bot Setup
 intents = discord.Intents.default()
 intents.message_content = True
 discord_bot = commands.Bot(command_prefix="!", intents=intents)
@@ -72,7 +80,6 @@ def load_config():
             logger.info(f"🔒 Loading secrets from: {secret_path}")
             break
     if not secret_path:
-        # Fallback for logging purposes, config.read will fail safely
         secret_path = "secret.cfg"
 
     streamers_path = None
@@ -89,7 +96,6 @@ def load_config():
     if not config.read(files_to_read):
         raise FileNotFoundError("❌ Failed to parse config files.")
 
-    # Parse Constants
     DISCORD_TOKEN = config["discord"]["token"]
     DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
     TWITCH_CLIENT_ID = config["twitch"]["clientid"]
@@ -102,7 +108,6 @@ def load_config():
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
 
-    # Parse Streamers
     if "streamers" in config:
         logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
         for s_id, s_name in config["streamers"].items():
@@ -117,19 +122,33 @@ def load_config():
             if c_id not in ["api_key", "backfill_check"]:
                 YOUTUBE_STREAMERS[str(c_id)] = c_name
 
+def parse_s3_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme != "s3":
+        raise ValueError("URL must start with s3://")
+    return parsed.netloc, parsed.path.lstrip('/')
+
 def sync_state_from_s3():
     try:
-        logger.info("☁️  Downloading state from S3...")
-        env = {**os.environ, "HOME": "/tmp"}
-        subprocess.run(["aws", "s3", "cp", S3_BUCKET_URL, STATE_FILE], check=True, timeout=10, env=env)
+        logger.info("☁️  Downloading state from S3 (via boto3)...")
+        bucket, key = parse_s3_url(S3_BUCKET_URL)
+        s3 = boto3.client('s3')
+        s3.download_file(bucket, key, STATE_FILE)
+        logger.info("✅ State downloaded.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == "404":
+            logger.warning("⚠️  State file not found on S3 (First run?)")
+        else:
+            logger.warning(f"⚠️  S3 Download Error: {e}")
     except Exception as e:
-        logger.warning(f"⚠️  Could not download state (First run?): {e}")
+        logger.warning(f"⚠️  S3 Error: {e}")
 
 def sync_state_to_s3():
     try:
         save_local_state()
-        env = {**os.environ, "HOME": "/tmp"}
-        subprocess.run(["aws", "s3", "cp", STATE_FILE, S3_BUCKET_URL], check=False, env=env)
+        bucket, key = parse_s3_url(S3_BUCKET_URL)
+        s3 = boto3.client('s3')
+        s3.upload_file(STATE_FILE, bucket, key)
         logger.info("☁️  State synced to S3.")
     except Exception as e:
         logger.error(f"❌ S3 Sync failed: {e}")
@@ -162,7 +181,6 @@ def load_local_state(bot_instance):
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
-        # FORCE IPv4 on the Server (host="0.0.0.0")
         self.web_adapter = AiohttpAdapter(host="0.0.0.0", port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
         self.session = None
         super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
@@ -176,7 +194,6 @@ class HybridBot(twitchio.Client):
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT} (IPv4)")
-        # FORCE IPv4 on the Client (outgoing requests)
         conn = TCPConnector(family=socket.AF_INET)
         self.session = ClientSession(connector=conn)
         
@@ -194,7 +211,6 @@ class HybridBot(twitchio.Client):
             await self.session.close()
         await super().close()
 
-    # YouTube Logic
     async def youtube_webhook_handler(self, request):
         if request.method == 'GET':
             challenge = request.query.get('hub.challenge')
@@ -224,8 +240,6 @@ class HybridBot(twitchio.Client):
 
         for channel_id in YOUTUBE_STREAMERS:
             playlist_id = None
-            
-            # Step 1: Try Official API to get Playlist ID
             try:
                 url = "https://www.googleapis.com/youtube/v3/channels"
                 params = {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
@@ -241,11 +255,9 @@ class HybridBot(twitchio.Client):
             except Exception as e:
                 logger.debug(f"   ⚠️ API Lookup exc for {channel_id}: {e}")
 
-            # Step 2: Fallback - Force Derive Playlist ID
             if not playlist_id and channel_id.startswith("UC"):
                 playlist_id = "UU" + channel_id[2:]
 
-            # Step 3: Fetch Playlist Items
             success = False
             if playlist_id:
                 try:
@@ -270,7 +282,6 @@ class HybridBot(twitchio.Client):
                 except Exception as e:
                     logger.debug(f"   ⚠️ Playlist Fetch exc: {e}")
 
-            # Step 4: Final Fallback - RSS
             if not success:
                 try:
                     url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
@@ -481,7 +492,6 @@ async def autosave_state_task():
 
 @discord_bot.event
 async def setup_hook() -> None:
-    # Important: Initialize twitch_bot only if config loaded successfully
     if twitch_bot:
         discord_bot.loop.create_task(twitch_bot.start())
     autosave_state_task.start()
@@ -507,7 +517,6 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        # Catch init errors that cause "silent" death
         logger.critical(f"🔥 FATAL ERROR: {e}")
         traceback.print_exc()
         sys.exit(1)
