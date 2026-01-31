@@ -10,6 +10,7 @@ import json
 import signal
 import subprocess
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from typing import Any
 from aiohttp import web, ClientSession
 from discord.ext import commands, tasks
@@ -149,9 +150,16 @@ class HybridBot(twitchio.Client):
         load_local_state(self)
         scheduler.start()
         await self.setup_twitch_subs()
+        
+        # FIX: Register route based on PUBLIC_URL path (e.g., /callback/youtube)
         if hasattr(self.web_adapter, '_app') and self.web_adapter._app:
-            self.web_adapter._app.router.add_post('/youtube', self.youtube_webhook_handler)
-            self.web_adapter._app.router.add_get('/youtube', self.youtube_webhook_handler)
+            path = urlparse(PUBLIC_URL).path.rstrip('/')
+            route = path + '/youtube'
+            
+            self.web_adapter._app.router.add_post(route, self.youtube_webhook_handler)
+            self.web_adapter._app.router.add_get(route, self.youtube_webhook_handler)
+            logger.info(f"✅ Registered YouTube Route: {route}")
+            
         asyncio.create_task(self.maintain_youtube_subs())
 
     async def close(self):
