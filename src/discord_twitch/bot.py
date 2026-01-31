@@ -192,45 +192,57 @@ class HybridBot(twitchio.Client):
             return
 
         tasks = []
-        # Spoof UA to prevent 403 on RSS
         rss_headers = {"User-Agent": "Mozilla/5.0 (compatible; DiscordTwitchBot/2.0; +http://discordapp.com)"}
 
         for channel_id in YOUTUBE_STREAMERS:
-            success = False
-            # Method 1: API (Get Uploads ID -> Get Items)
+            playlist_id = None
+            
+            # Step 1: Try Official API to get Playlist ID
             try:
-                # Step 1: Get correct Uploads Playlist ID
-                url_chan = "https://www.googleapis.com/youtube/v3/channels"
-                params_chan = {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
-                async with self.session.get(url_chan, params=params_chan) as resp_chan:
-                    if resp_chan.status == 200:
-                        data_chan = await resp_chan.json()
-                        if data_chan.get('items'):
-                            playlist_id = data_chan['items'][0]['contentDetails']['relatedPlaylists']['uploads']
-                            
-                            # Step 2: Get Playlist Items
-                            url_pli = "https://www.googleapis.com/youtube/v3/playlistItems"
-                            params_pli = {
-                                "part": "contentDetails", 
-                                "playlistId": playlist_id, 
-                                "maxResults": YOUTUBE_BACKFILL_CHECK, 
-                                "key": YOUTUBE_API_KEY
-                            }
-                            async with self.session.get(url_pli, params=params_pli) as resp_pli:
-                                if resp_pli.status == 200:
-                                    data_pli = await resp_pli.json()
-                                    for item in data_pli.get('items', []):
-                                        vid = item['contentDetails']['videoId']
-                                        tasks.append(self.initial_youtube_check(vid, save=False))
-                                    success = True
-                                else:
-                                    logger.warning(f"   ⚠️ PlaylistItems failed for {channel_id}: {resp_pli.status}")
-                    else:
-                        logger.warning(f"   ⚠️ Channel lookup failed for {channel_id}: {resp_chan.status}")
+                url = "https://www.googleapis.com/youtube/v3/channels"
+                params = {"part": "contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
+                async with self.session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get('items'):
+                            playlist_id = data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+                    elif resp.status == 403:
+                        err = await resp.json()
+                        reason = err.get('error', {}).get('message', 'Unknown 403')
+                        logger.warning(f"   ⚠️ API Lookup 403 for {channel_id}: {reason}")
             except Exception as e:
-                logger.debug(f"   ⚠️ API Backfill exc for {channel_id}: {e}")
+                logger.debug(f"   ⚠️ API Lookup exc: {e}")
 
-            # Method 2: Fallback to RSS with Spoofed UA
+            # Step 2: Fallback - Force Derive Playlist ID (UU...)
+            if not playlist_id and channel_id.startswith("UC"):
+                playlist_id = "UU" + channel_id[2:]
+
+            # Step 3: Fetch Playlist Items (Official API)
+            success = False
+            if playlist_id:
+                try:
+                    url = "https://www.googleapis.com/youtube/v3/playlistItems"
+                    params = {
+                        "part": "contentDetails",
+                        "playlistId": playlist_id,
+                        "maxResults": YOUTUBE_BACKFILL_CHECK,
+                        "key": YOUTUBE_API_KEY
+                    }
+                    async with self.session.get(url, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for item in data.get('items', []):
+                                vid = item['contentDetails']['videoId']
+                                tasks.append(self.initial_youtube_check(vid, save=False))
+                            success = True
+                        elif resp.status == 403:
+                            err = await resp.json()
+                            reason = err.get('error', {}).get('message', 'Unknown 403')
+                            logger.warning(f"   ⚠️ Playlist Fetch 403 for {channel_id}: {reason}")
+                except Exception as e:
+                    logger.debug(f"   ⚠️ Playlist Fetch exc: {e}")
+
+            # Step 4: Final Fallback - RSS (Spoofed)
             if not success:
                 try:
                     url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
@@ -244,9 +256,9 @@ class HybridBot(twitchio.Client):
                                 if vid_elem is not None and vid_elem.text:
                                     tasks.append(self.initial_youtube_check(vid_elem.text, save=False))
                         else:
-                            logger.warning(f"   ❌ RSS Backfill failed for {channel_id}: {resp.status}")
+                            logger.warning(f"   ❌ RSS Fallback failed for {channel_id}: {resp.status}")
                 except Exception as e:
-                    logger.warning(f"   ❌ RSS Backfill exc for {channel_id}: {e}")
+                    logger.warning(f"   ❌ RSS Fallback exc for {channel_id}: {e}")
         
         if tasks:
             await asyncio.gather(*tasks)
