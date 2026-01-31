@@ -141,13 +141,14 @@ class HybridBot(twitchio.Client):
         self.session = None
         super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
         
-        # Register routes IMMEDIATELY in __init__, before server start
-        if hasattr(self.web_adapter, '_app') and self.web_adapter._app:
-            path = urlparse(PUBLIC_URL).path.rstrip('/')
-            route = path + '/youtube'
-            self.web_adapter._app.router.add_post(route, self.youtube_webhook_handler)
-            self.web_adapter._app.router.add_get(route, self.youtube_webhook_handler)
-            logger.info(f"✅ Registered YouTube Route: {route}")
+        # Register routes directly on the adapter (which IS the web app in v3)
+        path = urlparse(PUBLIC_URL).path.rstrip('/')
+        route = path + '/youtube'
+        
+        # In TwitchIO v3, the adapter inherits from web.Application, so we use .router directly
+        self.web_adapter.router.add_post(route, self.youtube_webhook_handler)
+        self.web_adapter.router.add_get(route, self.youtube_webhook_handler)
+        logger.info(f"✅ Registered YouTube Route: {route}")
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
