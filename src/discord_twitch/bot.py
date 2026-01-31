@@ -11,7 +11,7 @@ import signal
 import subprocess
 import xml.etree.ElementTree as ET
 from typing import Any
-from aiohttp import web
+from aiohttp import web, ClientSession
 from discord.ext import commands, tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
@@ -72,7 +72,9 @@ if "streamers" in config:
     for s_id, s_name in config["streamers"].items():
         TWITCH_STREAMERS[str(s_id)] = s_name
 if "twitch" in config:
+    ignore_keys = ["clientid", "clientsecret", "eventsub_secret"]
     for s_id, s_name in config["twitch"].items():
+        if s_id.lower() in ignore_keys: continue
         TWITCH_STREAMERS[str(s_id)] = s_name
 if "youtube" in config:
     for c_id, c_name in config["youtube"].items():
@@ -135,10 +137,12 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
         self.web_adapter = AiohttpAdapter(port=LOCAL_PORT, domain=SERVER_DOMAIN, eventsub_secret=TWITCH_EVENTSUB_SECRET)
+        self.session = None
         super().__init__(client_id=TWITCH_CLIENT_ID, client_secret=TWITCH_CLIENT_SECRET, adapter=self.web_adapter)
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT}")
+        self.session = ClientSession()
         await discord_bot.wait_until_ready()
         await self.populate_message_cache()
         sync_state_from_s3()
@@ -149,6 +153,11 @@ class HybridBot(twitchio.Client):
             self.web_adapter._app.router.add_post('/youtube', self.youtube_webhook_handler)
             self.web_adapter._app.router.add_get('/youtube', self.youtube_webhook_handler)
         asyncio.create_task(self.maintain_youtube_subs())
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        await super().close()
 
     # YouTube Logic
     async def youtube_webhook_handler(self, request):
@@ -213,9 +222,10 @@ class HybridBot(twitchio.Client):
 
     async def fetch_youtube_data(self, video_id):
         if not YOUTUBE_API_KEY: return None
+        if not self.session: return None
         url = "https://www.googleapis.com/youtube/v3/videos"
         params = {"part": "snippet,liveStreamingDetails,statistics", "id": video_id, "key": YOUTUBE_API_KEY}
-        async with self.web_adapter._session.get(url, params=params) as resp:
+        async with self.session.get(url, params=params) as resp:
             if resp.status != 200: return None
             js = await resp.json()
             return js['items'][0] if js['items'] else None
@@ -260,8 +270,9 @@ class HybridBot(twitchio.Client):
             for cid in YOUTUBE_STREAMERS:
                 data = {"hub.mode": "subscribe", "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}", "hub.callback": f"{PUBLIC_URL}/youtube", "hub.lease_seconds": 432000}
                 try:
-                    async with self.web_adapter._session.post(hub_url, data=data) as resp:
-                        if resp.status >= 400: logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
+                    if self.session:
+                        async with self.session.post(hub_url, data=data) as resp:
+                            if resp.status >= 400: logger.error(f"   ❌ Failed sub for {cid}: {resp.status}")
                 except Exception as e:
                     logger.error(f"   ❌ Failed sub for {cid}: {e}")
             await asyncio.sleep(345600)
