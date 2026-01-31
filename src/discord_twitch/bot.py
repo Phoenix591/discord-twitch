@@ -186,21 +186,37 @@ class HybridBot(twitchio.Client):
         return web.Response(text="OK")
 
     async def run_youtube_backfill(self):
-        logger.info(f"🔎 Backfilling YouTube State from RSS (limit {YOUTUBE_BACKFILL_CHECK})...")
+        logger.info(f"🔎 Backfilling YouTube State from Uploads Playlist (limit {YOUTUBE_BACKFILL_CHECK})...")
+        if not YOUTUBE_API_KEY:
+            logger.warning("   ⚠️ No API Key found. Skipping Backfill.")
+            return
+
         tasks = []
         for channel_id in YOUTUBE_STREAMERS:
+            # Convert Channel ID (UC...) to Uploads Playlist ID (UU...)
+            if channel_id.startswith("UC"):
+                playlist_id = "UU" + channel_id[2:]
+            else:
+                logger.warning(f"   ⚠️ Cannot derive playlist for {channel_id}, skipping.")
+                continue
+
             try:
-                url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-                async with self.session.get(url) as resp:
-                    if resp.status != 200: continue
-                    xml_text = await resp.text()
-                
-                root = ET.fromstring(xml_text)
-                ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
-                
-                for entry in root.findall('atom:entry', ns)[:YOUTUBE_BACKFILL_CHECK]:
-                    vid = entry.find('yt:videoId', ns).text
-                    tasks.append(self.initial_youtube_check(vid, save=False))
+                url = "https://www.googleapis.com/youtube/v3/playlistItems"
+                params = {
+                    "part": "contentDetails",
+                    "playlistId": playlist_id,
+                    "maxResults": YOUTUBE_BACKFILL_CHECK,
+                    "key": YOUTUBE_API_KEY
+                }
+                async with self.session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"   ⚠️ Backfill API error for {channel_id}: {resp.status}")
+                        continue
+                    
+                    data = await resp.json()
+                    for item in data.get('items', []):
+                        vid = item['contentDetails']['videoId']
+                        tasks.append(self.initial_youtube_check(vid, save=False))
             except Exception as e:
                 logger.warning(f"   ⚠️ Backfill error for {channel_id}: {e}")
         
