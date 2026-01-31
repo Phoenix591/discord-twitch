@@ -220,11 +220,16 @@ class HybridBot(twitchio.Client):
             root = ET.fromstring(xml_text)
             ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
             entry = root.find('atom:entry', ns)
-            if entry:
-                video_id = entry.find('yt:videoId', ns).text
-                channel_id = entry.find('yt:channelId', ns).text
-                if channel_id in YOUTUBE_STREAMERS:
-                    asyncio.create_task(self.initial_youtube_check(video_id))
+            
+            if entry is not None:
+                vid_elem = entry.find('yt:videoId', ns)
+                cid_elem = entry.find('yt:channelId', ns)
+                
+                if vid_elem is not None and cid_elem is not None:
+                    video_id = vid_elem.text
+                    channel_id = cid_elem.text
+                    if channel_id in YOUTUBE_STREAMERS:
+                        asyncio.create_task(self.initial_youtube_check(video_id))
         except Exception as e:
             logger.error(f"YouTube XML Parse Error: {e}")
         return web.Response(text="OK")
