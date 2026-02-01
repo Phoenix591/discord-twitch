@@ -185,14 +185,13 @@ def sync_state_to_s3():
 def save_local_state():
     jobs = []
     for job in scheduler.get_jobs():
-        # FIX: Only save 'sniper' jobs (video_id, time), skip 'monitor' jobs (video_id)
         if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
             try:
                 jobs.append(
                     {"video_id": job.args[0], "scheduled_time": job.args[1].isoformat()}
                 )
             except IndexError:
-                pass  # Skip malformed or monitor jobs safely
+                pass
     with open(STATE_FILE, "w") as f:
         json.dump({"pending_checks": jobs}, f)
 
@@ -514,7 +513,6 @@ class HybridBot(twitchio.Client):
     async def send_youtube_notification(self, data):
         vid_id = data["id"]
 
-        # FIX: Check if notification exists before sending
         if vid_id in youtube_active_messages:
             logger.info(f"   ℹ️ Skipping duplicate notification for {vid_id}")
             return
@@ -745,19 +743,28 @@ class HybridBot(twitchio.Client):
             asyncio.create_task(self.delayed_check(s_id, s_login))
 
     def build_twitch_embed(self, login, data):
-        title = data.title if data else "Live Stream"
-        game = data.game_name if data else "Unknown"
+        if data:
+            title = data.title if data.title else "Live Stream"
+            game = data.game_name if data.game_name else "Unknown"
+            desc = f"**{login}** playing **{game}**"
+            ts = data.started_at
+            # Use .url_for() instead of string replacement
+            thumb_url = data.thumbnail.url_for(1280, 720) if data.thumbnail else None
+        else:
+            title = "Live Stream"
+            desc = f"**{login}** is LIVE!"
+            ts = datetime.datetime.now(datetime.timezone.utc)
+            thumb_url = None
+
         embed = discord.Embed(
             title=title,
             url=f"https://twitch.tv/{login}",
-            description=f"**{login}** playing **{game}**",
+            description=desc,
             color=0x9146FF,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            timestamp=ts,
         )
-        if data:
-            embed.set_image(
-                url=data.thumbnail_url.replace("{width}x{height}", "1280x720")
-            )
+        if thumb_url:
+            embed.set_image(url=thumb_url)
         return embed
 
 
