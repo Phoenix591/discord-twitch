@@ -220,11 +220,9 @@ class HybridBot(twitchio.Client):
             root = ET.fromstring(xml_text)
             ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://purl.org/yt/2012'}
             entry = root.find('atom:entry', ns)
-            
             if entry is not None:
                 vid_elem = entry.find('yt:videoId', ns)
                 cid_elem = entry.find('yt:channelId', ns)
-                
                 if vid_elem is not None and cid_elem is not None:
                     video_id = vid_elem.text
                     channel_id = cid_elem.text
@@ -447,10 +445,21 @@ class HybridBot(twitchio.Client):
         s_login = payload.broadcaster.name
         logger.info(f"📣 Twitch LIVE: {s_login}")
         stream_data = None
-        try:
-            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
-            if streams: stream_data = streams[0]
-        except: pass
+        
+        # Retry loop for race condition where API is not ready
+        for attempt in range(3):
+            try:
+                streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+                if streams:
+                    stream_data = streams[0]
+                    break
+            except Exception:
+                pass
+            
+            if attempt < 2:
+                logger.info(f"   ⏳ Stream data unavailable, retrying in 5s... ({attempt+1}/3)")
+                await asyncio.sleep(5)
+
         embed = self.build_twitch_embed(s_login, stream_data)
         chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
         if chan:
