@@ -42,7 +42,7 @@ config = configparser.ConfigParser()
 config.optionxform = str
 twitch_bot = None
 twitch_active_messages = {}
-youtube_active_messages = {}  # Tracks active YouTube notification messages
+youtube_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
 
@@ -185,10 +185,14 @@ def sync_state_to_s3():
 def save_local_state():
     jobs = []
     for job in scheduler.get_jobs():
-        if job.id.startswith("yt_"):
-            jobs.append(
-                {"video_id": job.args[0], "scheduled_time": job.args[1].isoformat()}
-            )
+        # FIX: Only save 'sniper' jobs (video_id, time), skip 'monitor' jobs (video_id)
+        if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
+            try:
+                jobs.append(
+                    {"video_id": job.args[0], "scheduled_time": job.args[1].isoformat()}
+                )
+            except IndexError:
+                pass  # Skip malformed or monitor jobs safely
     with open(STATE_FILE, "w") as f:
         json.dump({"pending_checks": jobs}, f)
 
@@ -222,7 +226,6 @@ def load_local_state(bot_instance):
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
-        # FORCE IPv4 on the Server (host="0.0.0.0")
         self.web_adapter = AiohttpAdapter(
             host="0.0.0.0",
             port=LOCAL_PORT,
@@ -509,11 +512,17 @@ class HybridBot(twitchio.Client):
             return js["items"][0] if js["items"] else None
 
     async def send_youtube_notification(self, data):
+        vid_id = data["id"]
+
+        # FIX: Check if notification exists before sending
+        if vid_id in youtube_active_messages:
+            logger.info(f"   ℹ️ Skipping duplicate notification for {vid_id}")
+            return
+
         channel_id = data["snippet"]["channelId"]
         channel_name = YOUTUBE_STREAMERS.get(
             channel_id, data["snippet"]["channelTitle"]
         )
-        vid_id = data["id"]
         url = f"https://www.youtube.com/watch?v={vid_id}"
 
         stats = data.get("statistics", {})
@@ -546,16 +555,15 @@ class HybridBot(twitchio.Client):
             msg = await chan.send(
                 content=f"{title_prefix} **{channel_name}** is LIVE! {url}", embed=embed
             )
-            if vid_id not in youtube_active_messages:
-                youtube_active_messages[vid_id] = msg
-                scheduler.add_job(
-                    self.check_youtube_offline,
-                    "interval",
-                    minutes=30,
-                    args=[vid_id],
-                    id=f"yt_monitor_{vid_id}",
-                    replace_existing=True,
-                )
+            youtube_active_messages[vid_id] = msg
+            scheduler.add_job(
+                self.check_youtube_offline,
+                "interval",
+                minutes=30,
+                args=[vid_id],
+                id=f"yt_monitor_{vid_id}",
+                replace_existing=True,
+            )
 
     def remove_youtube_job(self, video_id, save=True):
         job_id = f"yt_{video_id}"
