@@ -51,7 +51,7 @@ SystemCallErrorNumber=EPERM
 # =======================================================
 # 5. LIFECYCLE
 # =======================================================
-Restart=always
+Restart=on-failure
 RestartSec=5
 
 [Install]

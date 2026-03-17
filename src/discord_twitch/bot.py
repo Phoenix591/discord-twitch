@@ -20,6 +20,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
+import uuid
+import time
+
+INSTANCE_ID = str(uuid.uuid4())
 
 # Import boto3 for S3 access
 try:
@@ -220,6 +224,54 @@ def load_local_state(bot_instance):
         logger.info("♻️  Restored pending YouTube checks.")
     except Exception as e:
         logger.error(f"❌ Failed to load state: {e}")
+
+
+def signal_takeover():
+    try:
+        logger.info(
+            "🤝 Initiating handover sequence... signaling older instances via S3."
+        )
+        bucket, key = parse_s3_url(S3_BUCKET_URL)
+        handover_key = key.replace("state.json", "handover.json")
+        s3 = boto3.client("s3")
+        payload = json.dumps(
+            {
+                "instance_id": INSTANCE_ID,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        )
+        s3.put_object(Bucket=bucket, Key=handover_key, Body=payload)
+        logger.info("⏳ Waiting 15 seconds for old instance to sync state and yield...")
+        time.sleep(15)
+    except Exception as e:
+        logger.warning(f"⚠️ Handover signal failed (Will still attempt to start): {e}")
+
+
+@tasks.loop(seconds=15)
+async def monitor_handover_task():
+    try:
+        bucket, key = parse_s3_url(S3_BUCKET_URL)
+        handover_key = key.replace("state.json", "handover.json")
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket=bucket, Key=handover_key)
+        data = json.loads(response["Body"].read().decode("utf-8"))
+
+        # If the file was written by a DIFFERENT instance within the last 2 minutes...
+        if data.get("instance_id") != INSTANCE_ID:
+            sig_time = datetime.datetime.fromisoformat(data["timestamp"])
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if (now - sig_time).total_seconds() < 120:
+                logger.info(
+                    "🛑 Takeover signal received! Flushing state and yielding gracefully..."
+                )
+                await shutdown_handler(signal.SIGTERM)
+                # Exit with code 0 so systemd 'on-failure' leaves this process dead
+                os._exit(0)
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "NoSuchKey":
+            pass  # Ignore standard 404s if the file doesn't exist yet
+    except Exception:
+        pass  # Suppress other errors to keep the logs clean
 
 
 # Main Hybrid Bot Class
@@ -778,6 +830,7 @@ async def setup_hook() -> None:
     if twitch_bot:
         discord_bot.loop.create_task(twitch_bot.start())
     autosave_state_task.start()
+    monitor_handover_task.start()
 
 
 async def shutdown_handler(signal_type):
