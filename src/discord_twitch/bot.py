@@ -850,6 +850,7 @@ def main() -> None:
 
     try:
         load_config()
+        signal_takeover()
         twitch_bot = HybridBot()
         discord_bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
