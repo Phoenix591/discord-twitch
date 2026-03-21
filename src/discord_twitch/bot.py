@@ -230,54 +230,6 @@ def load_local_state(bot_instance):
         logger.error(f"❌ Failed to load state: {e}")
 
 
-def signal_takeover():
-    try:
-        logger.info(
-            "🤝 Initiating handover sequence... signaling older instances via S3."
-        )
-        bucket, key = parse_s3_url(S3_BUCKET_URL)
-        handover_key = key.replace("state.json", "handover.json")
-        s3 = boto3.client("s3")
-        payload = json.dumps(
-            {
-                "instance_id": INSTANCE_ID,
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            }
-        )
-        s3.put_object(Bucket=bucket, Key=handover_key, Body=payload)
-        logger.info("⏳ Waiting 15 seconds for old instance to sync state and yield...")
-        time.sleep(15)
-    except Exception as e:
-        logger.warning(f"⚠️ Handover signal failed (Will still attempt to start): {e}")
-
-
-@tasks.loop(seconds=15)
-async def monitor_handover_task():
-    try:
-        bucket, key = parse_s3_url(S3_BUCKET_URL)
-        handover_key = key.replace("state.json", "handover.json")
-        s3 = boto3.client("s3")
-        response = s3.get_object(Bucket=bucket, Key=handover_key)
-        data = json.loads(response["Body"].read().decode("utf-8"))
-
-        # If the file was written by a DIFFERENT instance within the last 2 minutes...
-        if data.get("instance_id") != INSTANCE_ID:
-            sig_time = datetime.datetime.fromisoformat(data["timestamp"])
-            now = datetime.datetime.now(datetime.timezone.utc)
-            if (now - sig_time).total_seconds() < 120:
-                logger.info(
-                    "🛑 Takeover signal received! Flushing state and yielding gracefully..."
-                )
-                await shutdown_handler(signal.SIGTERM)
-                # Exit with code 0 so systemd 'on-failure' leaves this process dead
-                os._exit(0)
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "NoSuchKey":
-            pass  # Ignore standard 404s if the file doesn't exist yet
-    except Exception:
-        pass  # Suppress other errors to keep the logs clean
-
-
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
@@ -300,9 +252,10 @@ class HybridBot(twitchio.Client):
             self.web_adapter.router.add_post(route, self.youtube_webhook_handler)
             self.web_adapter.router.add_get(route, self.youtube_webhook_handler)
             logger.info(f"✅ Registered YouTube Route: {route}")
-            self.web_adapter.router.add_post('/internal/takeover', self.internal_takeover_handler)
+            self.web_adapter.router.add_post(
+                "/internal/takeover", self.internal_takeover_handler
+            )
             logger.info(f"Registered takeover handler")
-
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT} (IPv4)")
@@ -324,8 +277,8 @@ class HybridBot(twitchio.Client):
         await super().close()
 
     async def internal_takeover_handler(self, request):
-        signature = request.headers.get('X-Signature')
-        timestamp = request.headers.get('X-Timestamp')
+        signature = request.headers.get("X-Signature")
+        timestamp = request.headers.get("X-Timestamp")
 
         if not signature or not timestamp:
             return web.Response(status=401, text="Missing authentication headers")
@@ -335,38 +288,43 @@ class HybridBot(twitchio.Client):
             ts = float(timestamp)
             now = datetime.datetime.now(datetime.timezone.utc).timestamp()
             if abs(now - ts) > 60:
-                logger.warning(f"⚠️ Takeover attempt rejected: Expired timestamp ({timestamp})")
+                logger.warning(
+                    f"⚠️ Takeover attempt rejected: Expired timestamp ({timestamp})"
+                )
                 return web.Response(status=401, text="Expired timestamp")
         except ValueError:
             return web.Response(status=400, text="Invalid timestamp format")
 
         # 2. Cryptographic HMAC-SHA256 Verification
-        message = timestamp.encode('utf-8')
-        secret = INTERNAL_API_SECRET.encode('utf-8')
+        message = timestamp.encode("utf-8")
+        secret = INTERNAL_API_SECRET.encode("utf-8")
         expected_mac = hmac.new(secret, message, hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected_mac, signature):
-            logger.warning(f"⚠️ Unauthorized takeover attempt! Invalid signature from {request.remote}")
+            logger.warning(
+                f"⚠️ Unauthorized takeover attempt! Invalid signature from {request.remote}"
+            )
             return web.Response(status=403, text="Invalid signature")
 
         # 3. Success! Yield the server
-        logger.info("🛑 Authorized takeover signal received via API! Yielding gracefully...")
-        
+        logger.info(
+            "🛑 Authorized takeover signal received via API! Yielding gracefully..."
+        )
+
         # Schedule the shutdown so we can return the 200 OK response to Ansible immediately
         asyncio.create_task(self.delayed_shutdown())
-        
+
         return web.Response(status=200, text="Takeover accepted. Shutting down.")
 
     async def delayed_shutdown(self):
         # Wait 1 second to ensure the HTTP 200 OK is sent back to the client
         await asyncio.sleep(1)
-        
+
         # Trigger your existing clean shutdown logic (Syncs S3 and closes Discord)
         await shutdown_handler(signal.SIGTERM)
-        
+
         # Exit with code 0 so systemd's 'Restart=on-failure' leaves this dead process in the grave
         os._exit(0)
-
 
     async def youtube_webhook_handler(self, request):
         if request.method == "GET":
@@ -882,7 +840,6 @@ async def setup_hook() -> None:
     if twitch_bot:
         discord_bot.loop.create_task(twitch_bot.start())
     autosave_state_task.start()
-    monitor_handover_task.start()
 
 
 async def shutdown_handler(signal_type):
@@ -902,7 +859,6 @@ def main() -> None:
 
     try:
         load_config()
-        signal_takeover()
         twitch_bot = HybridBot()
         discord_bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
