@@ -22,6 +22,8 @@ from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
 import uuid
 import time
+import hmac
+import hashlib
 
 INSTANCE_ID = str(uuid.uuid4())
 
@@ -64,6 +66,7 @@ PUBLIC_URL = ""
 LOCAL_PORT = 8080
 TWITCH_STREAMERS = {}
 YOUTUBE_STREAMERS = {}
+INTERNAL_API_SECRET = ""
 
 # Discord Bot Setup
 intents = discord.Intents.default()
@@ -75,7 +78,7 @@ def load_config():
     global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
     global TWITCH_EVENTSUB_SECRET, YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
     global S3_BUCKET_URL, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
-    global TWITCH_STREAMERS, YOUTUBE_STREAMERS
+    global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
 
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
     secret_path = None
@@ -135,6 +138,7 @@ def load_config():
     SERVER_DOMAIN = config["server"]["domain"]
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
+    INTERNAL_API_SECRET = config["server"]["internal_api_secret"]
 
     if "streamers" in config:
         logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
@@ -296,6 +300,9 @@ class HybridBot(twitchio.Client):
             self.web_adapter.router.add_post(route, self.youtube_webhook_handler)
             self.web_adapter.router.add_get(route, self.youtube_webhook_handler)
             logger.info(f"✅ Registered YouTube Route: {route}")
+            self.web_adapter.router.add_post('/internal/takeover', self.internal_takeover_handler)
+            logger.info(f"Registered takeover handler")
+
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT} (IPv4)")
@@ -315,6 +322,51 @@ class HybridBot(twitchio.Client):
         if self.session:
             await self.session.close()
         await super().close()
+
+    async def internal_takeover_handler(self, request):
+        signature = request.headers.get('X-Signature')
+        timestamp = request.headers.get('X-Timestamp')
+
+        if not signature or not timestamp:
+            return web.Response(status=401, text="Missing authentication headers")
+
+        # 1. Validate Timestamp to prevent replay attacks (must be within 60 seconds)
+        try:
+            ts = float(timestamp)
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            if abs(now - ts) > 60:
+                logger.warning(f"⚠️ Takeover attempt rejected: Expired timestamp ({timestamp})")
+                return web.Response(status=401, text="Expired timestamp")
+        except ValueError:
+            return web.Response(status=400, text="Invalid timestamp format")
+
+        # 2. Cryptographic HMAC-SHA256 Verification
+        message = timestamp.encode('utf-8')
+        secret = INTERNAL_API_SECRET.encode('utf-8')
+        expected_mac = hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(expected_mac, signature):
+            logger.warning(f"⚠️ Unauthorized takeover attempt! Invalid signature from {request.remote}")
+            return web.Response(status=403, text="Invalid signature")
+
+        # 3. Success! Yield the server
+        logger.info("🛑 Authorized takeover signal received via API! Yielding gracefully...")
+        
+        # Schedule the shutdown so we can return the 200 OK response to Ansible immediately
+        asyncio.create_task(self.delayed_shutdown())
+        
+        return web.Response(status=200, text="Takeover accepted. Shutting down.")
+
+    async def delayed_shutdown(self):
+        # Wait 1 second to ensure the HTTP 200 OK is sent back to the client
+        await asyncio.sleep(1)
+        
+        # Trigger your existing clean shutdown logic (Syncs S3 and closes Discord)
+        await shutdown_handler(signal.SIGTERM)
+        
+        # Exit with code 0 so systemd's 'Restart=on-failure' leaves this dead process in the grave
+        os._exit(0)
+
 
     async def youtube_webhook_handler(self, request):
         if request.method == "GET":
