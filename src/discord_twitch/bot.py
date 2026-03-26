@@ -24,6 +24,7 @@ import uuid
 import time
 import hmac
 import hashlib
+import secrets
 
 INSTANCE_ID = str(uuid.uuid4())
 
@@ -52,6 +53,7 @@ twitch_active_tasks = {}
 youtube_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
+YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
 
 # Config Placeholders
 DISCORD_TOKEN = ""
@@ -333,8 +335,28 @@ class HybridBot(twitchio.Client):
             return (
                 web.Response(text=challenge) if challenge else web.Response(status=404)
             )
+
+        # 1. Read the raw body bytes for signature verification
+        body = await request.read()
+
+        # 2. Verify Google's Signature (YouTube uses SHA1)
+        signature = request.headers.get("X-Hub-Signature")
+        if not signature:
+            logger.warning("⚠️ YouTube Webhook missing signature! (Spoof attempt?)")
+            return web.Response(status=403, text="Forbidden")
+
+        secret = YOUTUBE_WEBHOOK_SECRET.encode("utf-8")
+        expected_mac = "sha1=" + hmac.new(secret, body, hashlib.sha1).hexdigest()
+
+        if not hmac.compare_digest(expected_mac, signature):
+            logger.warning(
+                f"⚠️ YouTube Webhook signature mismatch! Unauthorized access attempt from {request.remote}"
+            )
+            return web.Response(status=403, text="Invalid signature")
+
+        # 3. Parse the verified XML
         try:
-            xml_text = await request.text()
+            xml_text = body.decode("utf-8")
             root = ET.fromstring(xml_text)
             ns = {
                 "atom": "http://www.w3.org/2005/Atom",
@@ -351,6 +373,7 @@ class HybridBot(twitchio.Client):
                         asyncio.create_task(self.initial_youtube_check(video_id))
         except Exception as e:
             logger.error(f"YouTube XML Parse Error: {e}")
+
         return web.Response(text="OK")
 
     async def run_youtube_backfill(self):
@@ -644,6 +667,7 @@ class HybridBot(twitchio.Client):
                     "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
                     "hub.callback": f"{PUBLIC_URL}/youtube",
                     "hub.lease_seconds": 432000,
+                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
                 }
                 try:
                     if self.session:
