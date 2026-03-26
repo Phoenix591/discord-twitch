@@ -48,6 +48,7 @@ config = configparser.ConfigParser()
 config.optionxform = str
 twitch_bot = None
 twitch_active_messages = {}
+twitch_active_tasks = {}
 youtube_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
@@ -710,7 +711,7 @@ class HybridBot(twitchio.Client):
                             if found_id:
                                 if found_id not in twitch_active_messages:
                                     twitch_active_messages[found_id] = message
-                                    asyncio.create_task(
+                                    twitch_active_tasks[found_id] = asyncio.create_task(
                                         self.delayed_check(found_id, login)
                                     )
 
@@ -770,7 +771,11 @@ class HybridBot(twitchio.Client):
                 embed=embed,
             )
             twitch_active_messages[s_id] = msg
-            asyncio.create_task(self.delayed_check(s_id, s_login))
+            if s_id in twitch_active_tasks:
+                twitch_active_tasks[s_id].cancel()
+            twitch_active_tasks[s_id] = asyncio.create_task(
+                self.delayed_check(s_id, s_login)
+            )
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
         s_id = str(payload.broadcaster.id)
@@ -786,12 +791,16 @@ class HybridBot(twitchio.Client):
             except:
                 pass
             del twitch_active_messages[s_id]
+            if s_id in twitch_active_tasks:
+                twitch_active_tasks[s_id].cancel()
+                del twitch_active_tasks[s_id]
 
     async def delayed_check(self, s_id: str, s_login: str) -> None:
-        await asyncio.sleep(3600)
-        if s_id not in twitch_active_messages:
-            return
-        try:
+        try:  # <-- Move this to the very top!
+            await asyncio.sleep(3600)
+            if s_id not in twitch_active_messages:
+                return
+
             streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
             if not streams:
                 ts = int(datetime.datetime.now().timestamp())
@@ -802,13 +811,26 @@ class HybridBot(twitchio.Client):
                 )
                 await twitch_active_messages[s_id].edit(content=None, embed=embed)
                 del twitch_active_messages[s_id]
+
+                if s_id in twitch_active_tasks:
+                    del twitch_active_tasks[s_id]
             else:
                 await twitch_active_messages[s_id].edit(
                     embed=self.build_twitch_embed(s_login, streams[0])
                 )
-                asyncio.create_task(self.delayed_check(s_id, s_login))
-        except:
-            asyncio.create_task(self.delayed_check(s_id, s_login))
+                twitch_active_tasks[s_id] = asyncio.create_task(
+                    self.delayed_check(s_id, s_login)
+                )
+
+        except asyncio.CancelledError:
+            # Task was canceled cleanly; do nothing
+            pass
+        except Exception as e:
+            logger.error(f"Error in delayed check for {s_login}: {e}")
+            # Try again in an hour if there was a temporary network error
+            twitch_active_tasks[s_id] = asyncio.create_task(
+                self.delayed_check(s_id, s_login)
+            )
 
     def build_twitch_embed(self, login, data):
         if data:
