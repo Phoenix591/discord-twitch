@@ -708,8 +708,11 @@ class HybridBot(twitchio.Client):
                                 None,
                             )
                             if found_id:
-                                twitch_active_messages[found_id] = message
-                                asyncio.create_task(self.delayed_check(found_id, login))
+                                if found_id not in twitch_active_messages:
+                                    twitch_active_messages[found_id] = message
+                                    asyncio.create_task(
+                                        self.delayed_check(found_id, login)
+                                    )
 
                     # YouTube Logic (Red or Gold)
                     elif embed.color.value in [16711680, 16766720]:
@@ -738,6 +741,9 @@ class HybridBot(twitchio.Client):
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
         s_id = payload.broadcaster.id
         s_login = payload.broadcaster.name
+        if s_id in twitch_active_messages:
+            logger.info(f"   ℹ️ Ignoring duplicate online event for {s_login}")
+            return
         logger.info(f"📣 Twitch LIVE: {s_login}")
         stream_data = None
 
