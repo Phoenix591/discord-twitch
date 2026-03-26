@@ -449,7 +449,7 @@ class HybridBot(twitchio.Client):
 
         if tasks:
             await asyncio.gather(*tasks)
-            sync_state_to_s3()
+            await asyncio.to_thread(sync_state_to_s3)
 
     async def initial_youtube_check(self, video_id, save=True):
         data = await self.fetch_youtube_data(video_id)
@@ -479,7 +479,7 @@ class HybridBot(twitchio.Client):
                 replace_existing=True,
             )
             if save:
-                sync_state_to_s3()
+                await asyncio.to_thread(sync_state_to_s3)
 
     async def check_youtube_status(self, video_id, scheduled_time):
         data = await self.fetch_youtube_data(video_id)
@@ -513,7 +513,7 @@ class HybridBot(twitchio.Client):
             )
         else:
             logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
-            sync_state_to_s3()
+            await asyncio.to_thread(sync_state_to_s3)
 
     async def check_youtube_offline(self, video_id):
         if video_id not in youtube_active_messages:
@@ -838,7 +838,7 @@ class HybridBot(twitchio.Client):
 
 @tasks.loop(minutes=90)
 async def autosave_state_task():
-    sync_state_to_s3()
+    await asyncio.to_thread(sync_state_to_s3)
 
 
 @discord_bot.event
@@ -850,10 +850,11 @@ async def setup_hook() -> None:
 
 async def shutdown_handler(signal_type):
     logger.info(f"🛑 Received {signal_type.name}...")
-    sync_state_to_s3()
+    await asyncio.to_thread(sync_state_to_s3)
     await discord_bot.close()
     if twitch_bot:
         await twitch_bot.close()
+    os._exit(0)
 
 
 def main() -> None:
