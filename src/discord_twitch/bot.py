@@ -225,16 +225,21 @@ def sync_state_from_s3():
 
 def sync_state_to_s3():
     try:
-        save_local_state()
+        state_json = save_local_state()
         bucket, key = parse_s3_url(S3_BUCKET_URL)
         s3 = boto3.client("s3")
-        s3.upload_file(STATE_FILE, bucket, key)
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=state_json.encode('utf-8'),
+            ContentType='application/json'
+        )
         logger.info("☁️  State synced to S3.")
     except Exception as e:
         logger.error(f"❌ S3 Sync failed: {e}")
 
 
-def save_local_state():
+def save_local_state() -> str:
     jobs = []
     for job in scheduler.get_jobs():
         if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
@@ -244,8 +249,11 @@ def save_local_state():
                 )
             except IndexError:
                 pass
+    state_json = json.dumps({"pending_checks": jobs})
     with open(STATE_FILE, "w") as f:
         json.dump({"pending_checks": jobs}, f)
+        f.write(state_json)
+    return state_json
 
 
 def load_local_state(bot_instance):
