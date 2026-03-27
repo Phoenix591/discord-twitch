@@ -93,13 +93,26 @@ class DiscordTwitchBot(commands.Bot):
 
         if twitch_bot:
             logger.info("🛑 Shutting down Twitch Bot...")
-            await twitch_bot.close()
+            try:
+                await twitch_bot.close()
+            except Exception as e:
+                logger.error(f"Error closing Twitch bot: {e}")
 
         logger.info("🛑 Shutting down Scheduler...")
-        scheduler.shutdown(wait=False)
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.error(f"Error closing scheduler: {e}")
 
         logger.info("🛑 Shutting down Discord Bot...")
-        await super().close()
+        try:
+            await super().close()
+        except Exception as e:
+            logger.error(f"Error closing Discord bot: {e}")
+
+        logger.info("👋 Exiting successfully (End of close sequence)")
+        # Force immediate success exit, bypassing asyncio's fragile background thread teardown
+        os._exit(0)
 
 
 # Create the global instance using the new class
