@@ -54,13 +54,13 @@ youtube_active_messages = {}
 STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
 YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
+TWITCH_EVENTSUB_SECRET = secrets.token_hex(32)
 
 # Config Placeholders
 DISCORD_TOKEN = ""
 DISCORD_CHANNEL_ID = 0
 TWITCH_CLIENT_ID = ""
 TWITCH_CLIENT_SECRET = ""
-TWITCH_EVENTSUB_SECRET = ""
 YOUTUBE_API_KEY = ""
 YOUTUBE_BACKFILL_CHECK = 2
 S3_BUCKET_URL = ""
@@ -79,7 +79,7 @@ discord_bot = commands.Bot(command_prefix="!", intents=intents)
 
 def load_config():
     global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
-    global TWITCH_EVENTSUB_SECRET, YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
+    global YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
     global S3_BUCKET_URL, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
 
@@ -128,7 +128,6 @@ def load_config():
     DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
     TWITCH_CLIENT_ID = config["twitch"]["clientid"]
     TWITCH_CLIENT_SECRET = config["twitch"]["clientsecret"]
-    TWITCH_EVENTSUB_SECRET = config["twitch"]["eventsub_secret"]
     YOUTUBE_API_KEY = (
         config["youtube"].get("api_key", "") if "youtube" in config else ""
     )
