@@ -231,8 +231,8 @@ def sync_state_to_s3():
         s3.put_object(
             Bucket=bucket,
             Key=key,
-            Body=state_json.encode('utf-8'),
-            ContentType='application/json'
+            Body=state_json.encode("utf-8"),
+            ContentType="application/json",
         )
         logger.info("☁️  State synced to S3.")
     except Exception as e:
