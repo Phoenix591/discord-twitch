@@ -71,10 +71,39 @@ TWITCH_STREAMERS = {}
 YOUTUBE_STREAMERS = {}
 INTERNAL_API_SECRET = ""
 
+
 # Discord Bot Setup
-intents = discord.Intents.default()
-intents.message_content = True
-discord_bot = commands.Bot(command_prefix="!", intents=intents)
+class DiscordTwitchBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self) -> None:
+        if twitch_bot:
+            self.loop.create_task(twitch_bot.start())
+        autosave_state_task.start()
+
+    async def close(self):
+        logger.info("🛑 Received shutdown signal. Saving state...")
+        try:
+            await asyncio.to_thread(sync_state_to_s3)
+        except Exception as e:
+            logger.error(f"Error saving state on shutdown: {e}")
+
+        if twitch_bot:
+            logger.info("🛑 Shutting down Twitch Bot...")
+            await twitch_bot.close()
+
+        logger.info("🛑 Shutting down Scheduler...")
+        scheduler.shutdown(wait=False)
+
+        logger.info("🛑 Shutting down Discord Bot...")
+        await super().close()
+
+
+# Create the global instance using the new class
+discord_bot = DiscordTwitchBot()
 
 
 def load_config():
@@ -323,7 +352,7 @@ class HybridBot(twitchio.Client):
         await asyncio.sleep(1)
 
         # Trigger your existing clean shutdown logic (Syncs S3 and closes Discord)
-        await shutdown_handler(signal.SIGTERM)
+        await discord_bot.close()
 
         # Exit with code 0 so systemd's 'Restart=on-failure' leaves this dead process in the grave
         os._exit(0)
@@ -886,29 +915,8 @@ async def autosave_state_task():
     await asyncio.to_thread(sync_state_to_s3)
 
 
-@discord_bot.event
-async def setup_hook() -> None:
-    if twitch_bot:
-        discord_bot.loop.create_task(twitch_bot.start())
-    autosave_state_task.start()
-
-
-async def shutdown_handler(signal_type):
-    logger.info(f"🛑 Received {signal_type.name}...")
-    await asyncio.to_thread(sync_state_to_s3)
-    await discord_bot.close()
-    if twitch_bot:
-        await twitch_bot.close()
-    os._exit(0)
-
-
 def main() -> None:
     global twitch_bot
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown_handler(s)))
-
     try:
         load_config()
         twitch_bot = HybridBot()
@@ -919,6 +927,8 @@ def main() -> None:
         logger.critical(f"🔥 FATAL ERROR: {e}")
         traceback.print_exc()
         sys.exit(1)
+    logger.info("Exiting sucessfully ( End of main )")
+    os._exit(0)
 
 
 if __name__ == "__main__":
