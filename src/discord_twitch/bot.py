@@ -718,19 +718,28 @@ class HybridBot(twitchio.Client):
                     "hub.lease_seconds": 432000,
                     "hub.secret": YOUTUBE_WEBHOOK_SECRET,
                 }
-                try:
-                    if self.session:
-                        async with self.session.post(hub_url, data=data) as resp:
-                            if resp.status >= 400:
-                                logger.error(
-                                    f"   ❌ Failed sub for {cid}: {resp.status}"
-                                )
-                            else:
-                                logger.info(
-                                    f"   ➜ Subscribed to YouTube: {YOUTUBE_STREAMERS[cid]} ({cid})"
-                                )
-                except Exception as e:
-                    logger.error(f"   ❌ Failed sub for {cid}: {e}")
+                for attempt in range(4):
+                    try:
+                        if self.session:
+                            async with self.session.post(hub_url, data=data) as resp:
+                                if resp.status >= 400:
+                                    logger.error(
+                                        f"   ❌ Failed sub for {cid} (HTTP {resp.status}) - Attempt {attempt + 1}/4"
+                                    )
+                                    if attempt < 3:
+                                        # Sleep for 15 seconds before retrying
+                                        await asyncio.sleep(15)
+                                else:
+                                    logger.info(
+                                        f"   ➜ Subscribed to YouTube: {YOUTUBE_STREAMERS[cid]} ({cid})"
+                                    )
+                                    break  # Success, break out of the retry loop
+                    except Exception as e:
+                        logger.error(
+                            f"   ❌ Failed sub for {cid} ({e}) - Attempt {attempt + 1}/4"
+                        )
+                        if attempt < 3:
+                            await asyncio.sleep(15)
             await asyncio.sleep(345600)
 
     # Twitch Logic
