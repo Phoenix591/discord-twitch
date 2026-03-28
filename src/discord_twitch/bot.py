@@ -51,19 +51,18 @@ twitch_bot = None
 twitch_active_messages = {}
 twitch_active_tasks = {}
 youtube_active_messages = {}
-STATE_FILE = "state.json"
 scheduler = AsyncIOScheduler()
 YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
 TWITCH_EVENTSUB_SECRET = secrets.token_hex(32)
 
 # Config Placeholders
+DYNAMODB_TABLE_NAME = ""
 DISCORD_TOKEN = ""
 DISCORD_CHANNEL_ID = 0
 TWITCH_CLIENT_ID = ""
 TWITCH_CLIENT_SECRET = ""
 YOUTUBE_API_KEY = ""
 YOUTUBE_BACKFILL_CHECK = 2
-S3_BUCKET_URL = ""
 SERVER_DOMAIN = ""
 PUBLIC_URL = ""
 LOCAL_PORT = 8080
@@ -87,7 +86,7 @@ class DiscordTwitchBot(commands.Bot):
     async def close(self):
         logger.info("🛑 Received shutdown signal. Saving state...")
         try:
-            await asyncio.to_thread(sync_state_to_s3)
+            await asyncio.to_thread(sync_state_to_dynamodb)
         except Exception as e:
             logger.error(f"Error saving state on shutdown: {e}")
 
@@ -122,7 +121,7 @@ discord_bot = DiscordTwitchBot()
 def load_config():
     global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
     global YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
-    global S3_BUCKET_URL, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
+    global DYNAMODB_TABLE_NAME, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
 
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -176,9 +175,7 @@ def load_config():
     YOUTUBE_BACKFILL_CHECK = (
         int(config["youtube"].get("backfill_check", 2)) if "youtube" in config else 2
     )
-    S3_BUCKET_URL = config["server"].get(
-        "s3_state_url", "s3://phoenix591/discord-twitch/state.json"
-    )
+    DYNAMODB_TABLE_NAME = config["server"].get("dynamodb_table", "discord-twitch-state")
     SERVER_DOMAIN = config["server"]["domain"]
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
@@ -200,75 +197,25 @@ def load_config():
                 YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 
-def parse_s3_url(url):
-    parsed = urlparse(url)
-    if parsed.scheme != "s3":
-        raise ValueError("URL must start with s3://")
-    return parsed.netloc, parsed.path.lstrip("/")
-
-
-def sync_state_from_s3():
+def sync_state_from_dynamodb(bot_instance):
     try:
-        logger.info("☁️  Downloading state from S3 (via boto3)...")
-        bucket, key = parse_s3_url(S3_BUCKET_URL)
-        s3 = boto3.client("s3")
-        s3.download_file(bucket, key, STATE_FILE)
-        logger.info("✅ State downloaded.")
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "404":
-            logger.warning("⚠️  State file not found on S3 (First run?)")
-        else:
-            logger.warning(f"⚠️  S3 Download Error: {e}")
-    except Exception as e:
-        logger.warning(f"⚠️  S3 Error: {e}")
+        logger.info("☁️  Downloading state from DynamoDB...")
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
+        # Fetch all currently scheduled streams from the DB
+        response = table.scan()
+        items = response.get("Items", [])
 
-def sync_state_to_s3():
-    try:
-        state_json = save_local_state()
-        bucket, key = parse_s3_url(S3_BUCKET_URL)
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=state_json.encode("utf-8"),
-            ContentType="application/json",
-        )
-        logger.info("☁️  State synced to S3.")
-    except Exception as e:
-        logger.error(f"❌ S3 Sync failed: {e}")
-
-
-def save_local_state() -> str:
-    jobs = []
-    for job in scheduler.get_jobs():
-        if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
-            try:
-                jobs.append(
-                    {"video_id": job.args[0], "scheduled_time": job.args[1].isoformat()}
-                )
-            except IndexError:
-                pass
-    state_json = json.dumps({"pending_checks": jobs})
-    with open(STATE_FILE, "w") as f:
-        json.dump({"pending_checks": jobs}, f)
-        f.write(state_json)
-    return state_json
-
-
-def load_local_state(bot_instance):
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
         now = datetime.datetime.now(datetime.timezone.utc)
-        for item in data.get("pending_checks", []):
+        for item in items:
             vid = item["video_id"]
             s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
             run_date = s_time - datetime.timedelta(minutes=3)
+
             if run_date < now:
                 run_date = now + datetime.timedelta(seconds=5)
+
             scheduler.add_job(
                 bot_instance.check_youtube_status,
                 "date",
@@ -277,9 +224,45 @@ def load_local_state(bot_instance):
                 id=f"yt_{vid}",
                 replace_existing=True,
             )
-        logger.info("♻️  Restored pending YouTube checks.")
+        logger.info(
+            f"✅ State loaded from DynamoDB. Restored {len(items)} pending checks."
+        )
+    except ClientError as e:
+        logger.warning(f"⚠️  DynamoDB Error: {e}")
     except Exception as e:
-        logger.error(f"❌ Failed to load state: {e}")
+        logger.error(f"❌ Failed to load state from DynamoDB: {e}")
+
+
+def sync_state_to_dynamodb():
+    try:
+        # 1. Grab what is currently in our active memory
+        jobs = {}
+        for job in scheduler.get_jobs():
+            if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
+                try:
+                    jobs[job.args[0]] = job.args[1].isoformat()
+                except IndexError:
+                    pass
+
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+        # 2. Grab what is currently in the DB
+        response = table.scan()
+        db_items = response.get("Items", [])
+
+        # 3. Add or update active jobs
+        for vid, stime in jobs.items():
+            table.put_item(Item={"video_id": vid, "scheduled_time": stime})
+
+        # 4. Delete jobs that finished or were canceled
+        for item in db_items:
+            if item["video_id"] not in jobs:
+                table.delete_item(Key={"video_id": item["video_id"]})
+
+        logger.info("☁️  State synced to DynamoDB.")
+    except Exception as e:
+        logger.error(f"❌ DynamoDB Sync failed: {e}")
 
 
 # Main Hybrid Bot Class
@@ -316,8 +299,7 @@ class HybridBot(twitchio.Client):
 
         await discord_bot.wait_until_ready()
         await self.populate_message_cache()
-        sync_state_from_s3()
-        load_local_state(self)
+        await asyncio.to_thread(sync_state_from_dynamodb, self)
         scheduler.start()
         await self.setup_twitch_subs()
         await self.run_youtube_backfill()
@@ -522,7 +504,7 @@ class HybridBot(twitchio.Client):
 
         if tasks:
             await asyncio.gather(*tasks)
-            await asyncio.to_thread(sync_state_to_s3)
+            await asyncio.to_thread(sync_state_to_dynamodb)
 
     async def initial_youtube_check(self, video_id, save=True):
         data = await self.fetch_youtube_data(video_id)
@@ -552,7 +534,7 @@ class HybridBot(twitchio.Client):
                 replace_existing=True,
             )
             if save:
-                await asyncio.to_thread(sync_state_to_s3)
+                await asyncio.to_thread(sync_state_to_dynamodb)
 
     async def check_youtube_status(self, video_id, scheduled_time):
         data = await self.fetch_youtube_data(video_id)
@@ -586,7 +568,7 @@ class HybridBot(twitchio.Client):
             )
         else:
             logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
-            await asyncio.to_thread(sync_state_to_s3)
+            await asyncio.to_thread(sync_state_to_dynamodb)
 
     async def check_youtube_offline(self, video_id):
         if video_id not in youtube_active_messages:
@@ -703,7 +685,7 @@ class HybridBot(twitchio.Client):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
             if save:
-                sync_state_to_s3()
+                sync_state_to_dynamodb()
 
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
@@ -956,7 +938,7 @@ class HybridBot(twitchio.Client):
 
 @tasks.loop(minutes=90)
 async def autosave_state_task():
-    await asyncio.to_thread(sync_state_to_s3)
+    await asyncio.to_thread(sync_state_to_dynamodb)
 
 
 def main() -> None:
