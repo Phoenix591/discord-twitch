@@ -86,7 +86,7 @@ class DiscordTwitchBot(commands.Bot):
     async def close(self):
         logger.info("🛑 Received shutdown signal. Saving state...")
         try:
-            await asyncio.to_thread(sync_state_to_dynamodb)
+            await sync_state_to_dynamodb()
         except Exception as e:
             logger.error(f"Error saving state on shutdown: {e}")
 
@@ -197,15 +197,79 @@ def load_config():
                 YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 
-def sync_state_from_dynamodb(bot_instance):
+async def restore_twitch_state(bot_instance, channel, s_id, login, msg_id):
+    try:
+        msg = await channel.fetch_message(msg_id)
+        if s_id not in twitch_active_messages:
+            twitch_active_messages[s_id] = msg
+            twitch_active_tasks[s_id] = asyncio.create_task(
+                bot_instance.delayed_check(s_id, login)
+            )
+    except discord.NotFound:
+        pass  # Message was deleted manually while bot was offline
+    except Exception as e:
+        logger.error(f"Failed to fetch twitch message {msg_id}: {e}")
+
+
+async def restore_youtube_state(bot_instance, channel, vid, msg_id):
+    try:
+        msg = await channel.fetch_message(msg_id)
+        if vid not in youtube_active_messages:
+            youtube_active_messages[vid] = msg
+            scheduler.add_job(
+                bot_instance.check_youtube_offline,
+                "interval",
+                minutes=30,
+                args=[vid],
+                id=f"yt_monitor_{vid}",
+                replace_existing=True,
+            )
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        logger.error(f"Failed to fetch youtube message {msg_id}: {e}")
+
+
+# --- Helper functions for background threads ---
+def _db_scan():
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+    return table.scan().get("Items", [])
+
+
+def _db_push(jobs_data, tw_data, yt_data):
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+    response = table.scan()
+    db_items = response.get("Items", [])
+    active_db_keys = set()
+
+    for db_key, stime in jobs_data.items():
+        active_db_keys.add(db_key)
+        table.put_item(Item={"video_id": db_key, "scheduled_time": stime})
+
+    for db_key, item_data in tw_data.items():
+        active_db_keys.add(db_key)
+        table.put_item(Item=item_data)
+
+    for db_key, item_data in yt_data.items():
+        active_db_keys.add(db_key)
+        table.put_item(Item=item_data)
+
+    for item in db_items:
+        if item["video_id"] not in active_db_keys:
+            table.delete_item(Key={"video_id": item["video_id"]})
+
+
+# --- Main Async Sync Functions ---
+async def sync_state_from_dynamodb(bot_instance):
     try:
         logger.info("☁️  Downloading state from DynamoDB...")
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+        # 1. Run the blocking DB scan in a background thread
+        items = await asyncio.to_thread(_db_scan)
 
-        response = table.scan()
-        items = response.get("Items", [])
-
+        # 2. Back on the main thread, safely interact with Discord and asyncio
         now = datetime.datetime.now(datetime.timezone.utc)
         channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
 
@@ -253,85 +317,37 @@ def sync_state_from_dynamodb(bot_instance):
         logger.error(f"❌ Failed to load state from DynamoDB: {e}")
 
 
-async def restore_twitch_state(bot_instance, channel, s_id, login, msg_id):
+async def sync_state_to_dynamodb():
     try:
-        msg = await channel.fetch_message(msg_id)
-        if s_id not in twitch_active_messages:
-            twitch_active_messages[s_id] = msg
-            twitch_active_tasks[s_id] = asyncio.create_task(
-                bot_instance.delayed_check(s_id, login)
-            )
-    except discord.NotFound:
-        pass  # Message was deleted manually while bot was offline
-    except Exception as e:
-        logger.error(f"Failed to fetch twitch message {msg_id}: {e}")
-
-
-async def restore_youtube_state(bot_instance, channel, vid, msg_id):
-    try:
-        msg = await channel.fetch_message(msg_id)
-        if vid not in youtube_active_messages:
-            youtube_active_messages[vid] = msg
-            scheduler.add_job(
-                bot_instance.check_youtube_offline,
-                "interval",
-                minutes=30,
-                args=[vid],
-                id=f"yt_monitor_{vid}",
-                replace_existing=True,
-            )
-    except discord.NotFound:
-        pass
-    except Exception as e:
-        logger.error(f"Failed to fetch youtube message {msg_id}: {e}")
-
-
-def sync_state_to_dynamodb():
-    try:
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-
-        response = table.scan()
-        db_items = response.get("Items", [])
-        active_db_keys = set()
-
-        # 1. Push YouTube Jobs
+        # 1. Safely snapshot all memory states on the main thread
+        jobs_data = {}
         for job in scheduler.get_jobs():
             if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
                 try:
-                    vid = job.args[0]
-                    stime = job.args[1].isoformat()
-                    db_key = f"yt_{vid}"
-                    active_db_keys.add(db_key)
-                    table.put_item(Item={"video_id": db_key, "scheduled_time": stime})
+                    jobs_data[f"yt_{job.args[0]}"] = job.args[1].isoformat()
                 except IndexError:
                     pass
 
-        # 2. Push Twitch Active Messages
+        tw_data = {}
         for s_id, msg in twitch_active_messages.items():
-            db_key = f"tw_{s_id}"
-            active_db_keys.add(db_key)
-
-            # Extract login safely
             login = "Unknown"
             if msg.embeds and msg.embeds[0].url:
                 login = msg.embeds[0].url.split("/")[-1].lower()
+            tw_data[f"tw_{s_id}"] = {
+                "video_id": f"tw_{s_id}",
+                "message_id": str(msg.id),
+                "login": login,
+            }
 
-            table.put_item(
-                Item={"video_id": db_key, "message_id": str(msg.id), "login": login}
-            )
-
-        # 3. Push YouTube Active Messages
+        yt_data = {}
         for vid, msg in youtube_active_messages.items():
-            db_key = f"ytlive_{vid}"
-            active_db_keys.add(db_key)
-            table.put_item(Item={"video_id": db_key, "message_id": str(msg.id)})
+            yt_data[f"ytlive_{vid}"] = {
+                "video_id": f"ytlive_{vid}",
+                "message_id": str(msg.id),
+            }
 
-        # 4. Clean up inactive items from the DB
-        for item in db_items:
-            if item["video_id"] not in active_db_keys:
-                table.delete_item(Key={"video_id": item["video_id"]})
-
+        # 2. Pass the safely copied data to the background thread to upload
+        await asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data)
         logger.info("☁️  State synced to DynamoDB.")
     except Exception as e:
         logger.error(f"❌ DynamoDB Sync failed: {e}")
@@ -370,7 +386,7 @@ class HybridBot(twitchio.Client):
         self.session = ClientSession(connector=conn)
 
         await discord_bot.wait_until_ready()
-        await asyncio.to_thread(sync_state_from_dynamodb, self)
+        await sync_state_from_dynamodb(self)
         scheduler.start()
         await self.setup_twitch_subs()
         await self.run_youtube_backfill()
@@ -575,7 +591,7 @@ class HybridBot(twitchio.Client):
 
         if tasks:
             await asyncio.gather(*tasks)
-            await asyncio.to_thread(sync_state_to_dynamodb)
+            await sync_state_to_dynamodb()
 
     async def initial_youtube_check(self, video_id, save=True):
         data = await self.fetch_youtube_data(video_id)
@@ -605,7 +621,7 @@ class HybridBot(twitchio.Client):
                 replace_existing=True,
             )
             if save:
-                await asyncio.to_thread(sync_state_to_dynamodb)
+                await sync_state_to_dynamodb()
 
     async def check_youtube_status(self, video_id, scheduled_time):
         data = await self.fetch_youtube_data(video_id)
@@ -639,7 +655,7 @@ class HybridBot(twitchio.Client):
             )
         else:
             logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
-            await asyncio.to_thread(sync_state_to_dynamodb)
+            await sync_state_to_dynamodb()
 
     async def check_youtube_offline(self, video_id):
         if video_id not in youtube_active_messages:
@@ -756,7 +772,7 @@ class HybridBot(twitchio.Client):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
             if save:
-                asyncio.create_task(asyncio.to_thread(sync_state_to_dynamodb))
+                asyncio.create_task(sync_state_to_dynamodb())
 
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
@@ -955,7 +971,7 @@ class HybridBot(twitchio.Client):
 
 @tasks.loop(minutes=90)
 async def autosave_state_task():
-    await asyncio.to_thread(sync_state_to_dynamodb)
+    await sync_state_to_dynamodb()
 
 
 def main() -> None:
