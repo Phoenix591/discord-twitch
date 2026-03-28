@@ -918,14 +918,16 @@ class HybridBot(twitchio.Client):
         if data:
             title = data.title if data.title else "Live Stream"
             game = data.game_name if data.game_name else "Unknown"
-            desc = f"**{login}** playing **{game}**"
+
             if data.started_at:
                 start_unix = int(data.started_at.timestamp())
-                # Use Discord's <t:TIMESTAMP:t> to show the local short-time (e.g. 4:30 PM)
                 desc = f"**{login}** playing **{game}**\n*( started at <t:{start_unix}:t> )*"
             else:
                 desc = f"**{login}** playing **{game}**"
-            # Use .url_for() instead of string replacement
+
+            ts = datetime.datetime.now(datetime.timezone.utc)
+
+            # Append a cache-busting parameter (?t=...) so Discord fetches the new frame
             if data.thumbnail:
                 thumb_url = f"{data.thumbnail.url_for(1280, 720)}?t={int(time.time())}"
             else:
@@ -943,9 +945,12 @@ class HybridBot(twitchio.Client):
             color=0x9146FF,
             timestamp=ts,
         )
+
         embed.set_footer(text="Last Updated")
+
         if thumb_url:
             embed.set_image(url=thumb_url)
+
         return embed
 
 
