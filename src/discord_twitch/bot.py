@@ -203,61 +203,133 @@ def sync_state_from_dynamodb(bot_instance):
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
-        # Fetch all currently scheduled streams from the DB
         response = table.scan()
         items = response.get("Items", [])
 
         now = datetime.datetime.now(datetime.timezone.utc)
+        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+
         for item in items:
-            vid = item["video_id"]
-            s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
-            run_date = s_time - datetime.timedelta(minutes=3)
+            db_key = item["video_id"]
 
-            if run_date < now:
-                run_date = now + datetime.timedelta(seconds=5)
+            # --- 1. YOUTUBE SCHEDULED SNIPER ---
+            if db_key.startswith("yt_"):
+                vid = db_key[3:]
+                s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
+                run_date = s_time - datetime.timedelta(minutes=3)
+                if run_date < now:
+                    run_date = now + datetime.timedelta(seconds=5)
+                scheduler.add_job(
+                    bot_instance.check_youtube_status,
+                    "date",
+                    run_date=run_date,
+                    args=[vid, s_time],
+                    id=f"yt_{vid}",
+                    replace_existing=True,
+                )
+            # --- 2. TWITCH ACTIVE STREAMS ---
+            elif db_key.startswith("tw_"):
+                s_id = db_key[3:]
+                login = item.get("login", "")
+                msg_id = int(item.get("message_id", 0))
+                if channel and msg_id:
+                    asyncio.create_task(
+                        restore_twitch_state(bot_instance, channel, s_id, login, msg_id)
+                    )
 
-            scheduler.add_job(
-                bot_instance.check_youtube_status,
-                "date",
-                run_date=run_date,
-                args=[vid, s_time],
-                id=f"yt_{vid}",
-                replace_existing=True,
-            )
-        logger.info(
-            f"✅ State loaded from DynamoDB. Restored {len(items)} pending checks."
-        )
+            # --- 3. YOUTUBE ACTIVE STREAMS ---
+            elif db_key.startswith("ytlive_"):
+                vid = db_key[7:]
+                msg_id = int(item.get("message_id", 0))
+                if channel and msg_id:
+                    asyncio.create_task(
+                        restore_youtube_state(bot_instance, channel, vid, msg_id)
+                    )
+
+        logger.info(f"✅ State loaded from DynamoDB. Restored {len(items)} items.")
     except ClientError as e:
         logger.warning(f"⚠️  DynamoDB Error: {e}")
     except Exception as e:
         logger.error(f"❌ Failed to load state from DynamoDB: {e}")
 
 
+async def restore_twitch_state(bot_instance, channel, s_id, login, msg_id):
+    try:
+        msg = await channel.fetch_message(msg_id)
+        if s_id not in twitch_active_messages:
+            twitch_active_messages[s_id] = msg
+            twitch_active_tasks[s_id] = asyncio.create_task(
+                bot_instance.delayed_check(s_id, login)
+            )
+    except discord.NotFound:
+        pass  # Message was deleted manually while bot was offline
+    except Exception as e:
+        logger.error(f"Failed to fetch twitch message {msg_id}: {e}")
+
+
+async def restore_youtube_state(bot_instance, channel, vid, msg_id):
+    try:
+        msg = await channel.fetch_message(msg_id)
+        if vid not in youtube_active_messages:
+            youtube_active_messages[vid] = msg
+            scheduler.add_job(
+                bot_instance.check_youtube_offline,
+                "interval",
+                minutes=30,
+                args=[vid],
+                id=f"yt_monitor_{vid}",
+                replace_existing=True,
+            )
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        logger.error(f"Failed to fetch youtube message {msg_id}: {e}")
+
+
 def sync_state_to_dynamodb():
     try:
-        # 1. Grab what is currently in our active memory
-        jobs = {}
-        for job in scheduler.get_jobs():
-            if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
-                try:
-                    jobs[job.args[0]] = job.args[1].isoformat()
-                except IndexError:
-                    pass
-
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
-        # 2. Grab what is currently in the DB
         response = table.scan()
         db_items = response.get("Items", [])
+        active_db_keys = set()
 
-        # 3. Add or update active jobs
-        for vid, stime in jobs.items():
-            table.put_item(Item={"video_id": vid, "scheduled_time": stime})
+        # 1. Push YouTube Jobs
+        for job in scheduler.get_jobs():
+            if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
+                try:
+                    vid = job.args[0]
+                    stime = job.args[1].isoformat()
+                    db_key = f"yt_{vid}"
+                    active_db_keys.add(db_key)
+                    table.put_item(Item={"video_id": db_key, "scheduled_time": stime})
+                except IndexError:
+                    pass
 
-        # 4. Delete jobs that finished or were canceled
+        # 2. Push Twitch Active Messages
+        for s_id, msg in twitch_active_messages.items():
+            db_key = f"tw_{s_id}"
+            active_db_keys.add(db_key)
+
+            # Extract login safely
+            login = "Unknown"
+            if msg.embeds and msg.embeds[0].url:
+                login = msg.embeds[0].url.split("/")[-1].lower()
+
+            table.put_item(
+                Item={"video_id": db_key, "message_id": str(msg.id), "login": login}
+            )
+
+        # 3. Push YouTube Active Messages
+        for vid, msg in youtube_active_messages.items():
+            db_key = f"ytlive_{vid}"
+            active_db_keys.add(db_key)
+            table.put_item(Item={"video_id": db_key, "message_id": str(msg.id)})
+
+        # 4. Clean up inactive items from the DB
         for item in db_items:
-            if item["video_id"] not in jobs:
+            if item["video_id"] not in active_db_keys:
                 table.delete_item(Key={"video_id": item["video_id"]})
 
         logger.info("☁️  State synced to DynamoDB.")
@@ -298,7 +370,6 @@ class HybridBot(twitchio.Client):
         self.session = ClientSession(connector=conn)
 
         await discord_bot.wait_until_ready()
-        await self.populate_message_cache()
         await asyncio.to_thread(sync_state_from_dynamodb, self)
         scheduler.start()
         await self.setup_twitch_subs()
@@ -685,7 +756,7 @@ class HybridBot(twitchio.Client):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
             if save:
-                sync_state_to_dynamodb()
+                asyncio.create_task(asyncio.to_thread(sync_state_to_dynamodb))
 
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
@@ -748,60 +819,6 @@ class HybridBot(twitchio.Client):
                 logger.info(f"   ➜ Subscribed to Twitch: {s_name}")
             except Exception as e:
                 logger.error(f"   ❌ Failed Twitch {s_name}: {e}")
-
-    async def populate_message_cache(self) -> None:
-        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            return
-        try:
-            async for message in channel.history(limit=50):
-                if message.author != discord_bot.user or not message.embeds:
-                    continue
-                embed = message.embeds[0]
-                if embed.color:
-                    # Twitch Logic
-                    if embed.color.value == 9520895:
-                        url = embed.url
-                        if url:
-                            login = url.split("/")[-1].lower()
-                            found_id = next(
-                                (
-                                    i
-                                    for i, n in TWITCH_STREAMERS.items()
-                                    if n.lower() == login
-                                ),
-                                None,
-                            )
-                            if found_id:
-                                if found_id not in twitch_active_messages:
-                                    twitch_active_messages[found_id] = message
-                                    twitch_active_tasks[found_id] = asyncio.create_task(
-                                        self.delayed_check(found_id, login)
-                                    )
-
-                    # YouTube Logic (Red or Gold)
-                    elif embed.color.value in [16711680, 16766720]:
-                        if embed.url:
-                            try:
-                                parsed = urlparse(embed.url)
-                                if "youtube.com" in parsed.netloc:
-                                    qs = parse_qs(parsed.query)
-                                    vid_id = qs.get("v", [None])[0]
-                                    if vid_id:
-                                        youtube_active_messages[vid_id] = message
-                                        scheduler.add_job(
-                                            self.check_youtube_offline,
-                                            "interval",
-                                            minutes=30,
-                                            args=[vid_id],
-                                            id=f"yt_monitor_{vid_id}",
-                                            replace_existing=True,
-                                        )
-                            except:
-                                pass
-
-        except Exception as e:
-            logger.error(f"❌ Cache rebuild fail: {e}")
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
         s_id = str(payload.broadcaster.id)
