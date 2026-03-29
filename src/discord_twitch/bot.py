@@ -37,12 +37,24 @@ except ImportError:
     sys.exit(1)
 
 # Setup & Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("Bot")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S"
+)
+
+# Systemd Journal Handler (stdout)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# File for cloudwatch etc
+# systemd's LogsDirectory=discord-twitch creates this folder and gives us write access
+file_handler = logging.FileHandler(
+    "/var/log/discord-twitch/discord-twitch.log", encoding="utf-8"
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 # Global Variables
 config = configparser.ConfigParser()
