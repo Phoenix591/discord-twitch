@@ -56,6 +56,7 @@ YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
 TWITCH_EVENTSUB_SECRET = secrets.token_hex(32)
 
 # Config Placeholders
+DYNAMODB_REGION = "us-east-1"
 DYNAMODB_TABLE_NAME = ""
 DISCORD_TOKEN = ""
 DISCORD_CHANNEL_ID = 0
@@ -121,7 +122,7 @@ discord_bot = DiscordTwitchBot()
 def load_config():
     global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
     global YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
-    global DYNAMODB_TABLE_NAME, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
+    global DYNAMODB_TABLE_NAME, DYNAMODB_REGION, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
 
     cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -232,13 +233,13 @@ async def restore_youtube_state(bot_instance, channel, vid, msg_id):
 
 # --- Helper functions for background threads ---
 def _db_scan():
-    dynamodb = boto3.resource("dynamodb")
+    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     return table.scan().get("Items", [])
 
 
 def _db_push(jobs_data, tw_data, yt_data):
-    dynamodb = boto3.resource("dynamodb")
+    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
     response = table.scan()
