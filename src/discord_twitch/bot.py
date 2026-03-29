@@ -246,21 +246,23 @@ def _db_push(jobs_data, tw_data, yt_data):
     db_items = response.get("Items", [])
     active_db_keys = set()
 
-    for db_key, stime in jobs_data.items():
-        active_db_keys.add(db_key)
-        table.put_item(Item={"video_id": db_key, "scheduled_time": stime})
+    # Using batch_writer handles throttling and groups requests automatically!
+    with table.batch_writer() as batch:
+        for db_key, stime in jobs_data.items():
+            active_db_keys.add(db_key)
+            batch.put_item(Item={"video_id": db_key, "scheduled_time": stime})
 
-    for db_key, item_data in tw_data.items():
-        active_db_keys.add(db_key)
-        table.put_item(Item=item_data)
+        for db_key, item_data in tw_data.items():
+            active_db_keys.add(db_key)
+            batch.put_item(Item=item_data)
 
-    for db_key, item_data in yt_data.items():
-        active_db_keys.add(db_key)
-        table.put_item(Item=item_data)
+        for db_key, item_data in yt_data.items():
+            active_db_keys.add(db_key)
+            batch.put_item(Item=item_data)
 
-    for item in db_items:
-        if item["video_id"] not in active_db_keys:
-            table.delete_item(Key={"video_id": item["video_id"]})
+        for item in db_items:
+            if item["video_id"] not in active_db_keys:
+                batch.delete_item(Key={"video_id": item["video_id"]})
 
 
 # --- Main Async Sync Functions ---
