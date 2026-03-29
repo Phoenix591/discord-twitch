@@ -10,6 +10,7 @@ Group=discord-twitch
 
 ExecStart=/usr/local/discord-twitch/bin/python3 /usr/local/discord-twitch/bot.py
 LoadCredential=secret.cfg:/etc/discord-twitch/secret.cfg
+ExecStopPost=+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a append-config -m ec2 -c default
 
 # =======================================================
 # 2. STATELESS / EPHEMERAL ENV
