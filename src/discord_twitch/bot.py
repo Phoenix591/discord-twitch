@@ -124,6 +124,9 @@ class DiscordTwitchBot(commands.Bot):
 
         logger.info("👋 Exiting successfully (End of close sequence)")
         # Force immediate success exit, bypassing asyncio's fragile background thread teardown
+        for handler in logging.root.handlers:
+            handler.flush()
+        sys.stdout.flush()
         os._exit(0)
 
 
