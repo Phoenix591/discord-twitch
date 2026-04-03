@@ -62,6 +62,7 @@ config.optionxform = str
 twitch_bot = None
 twitch_active_messages = {}
 twitch_active_tasks = {}
+twitch_active_stream_ids = {}
 youtube_active_messages = {}
 scheduler = AsyncIOScheduler()
 YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
@@ -213,11 +214,15 @@ def load_config():
                 YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 
-async def restore_twitch_state(bot_instance, channel, s_id, login, msg_id):
+async def restore_twitch_state(
+    bot_instance, channel, s_id, login, msg_id, stream_id=""
+):
     try:
         msg = await channel.fetch_message(msg_id)
         if s_id not in twitch_active_messages:
             twitch_active_messages[s_id] = msg
+            if stream_id:
+                twitch_active_stream_ids[s_id] = stream_id
             twitch_active_tasks[s_id] = asyncio.create_task(
                 bot_instance.delayed_check(s_id, login)
             )
@@ -320,9 +325,12 @@ async def sync_state_from_dynamodb(bot_instance):
                 s_id = db_key[3:]
                 login = item.get("login", "")
                 msg_id = int(item.get("message_id", 0))
+                stream_id = item.get("stream_id", "")
                 if msg_id:
                     restore_tasks.append(
-                        restore_twitch_state(bot_instance, channel, s_id, login, msg_id)
+                        restore_twitch_state(
+                            bot_instance, channel, s_id, login, msg_id, stream_id
+                        )
                     )
 
             elif db_key.startswith("ytlive_"):
@@ -362,6 +370,7 @@ async def sync_state_to_dynamodb():
                 "video_id": f"tw_{s_id}",
                 "message_id": str(msg.id),
                 "login": login,
+                "stream_id": twitch_active_stream_ids.get(s_id, ""),
             }
 
         yt_data = {}
@@ -739,6 +748,27 @@ class HybridBot(twitchio.Client):
             js = await resp.json()
             return js["items"][0] if js["items"] else None
 
+    async def force_stream_offline(self, s_id: str, s_login: str):
+        if s_id in twitch_active_messages:
+            try:
+                ts = int(datetime.datetime.now().timestamp())
+                embed = discord.Embed(
+                    title=f"⚫ {s_login} ended.",
+                    description=f"Ended at <t:{ts}:T>.",
+                    color=0x2C2F33,
+                )
+                await twitch_active_messages[s_id].edit(content=None, embed=embed)
+            except Exception as e:
+                logger.debug(f"Could not edit offline message for {s_login}: {e}")
+            del twitch_active_messages[s_id]
+
+        if s_id in twitch_active_stream_ids:
+            del twitch_active_stream_ids[s_id]
+
+        if s_id in twitch_active_tasks:
+            twitch_active_tasks[s_id].cancel()
+            del twitch_active_tasks[s_id]
+
     async def send_youtube_notification(self, data):
         vid_id = data["id"]
 
@@ -861,13 +891,31 @@ class HybridBot(twitchio.Client):
             except Exception as e:
                 logger.error(f"   ❌ Failed Twitch {s_name}: {e}")
 
+    async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
+        s_id = str(payload.broadcaster.id)
+        s_login = payload.broadcaster.name
+        await self.force_stream_offline(s_id, s_login)
+        await sync_state_to_dynamodb()
+
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
         s_id = str(payload.broadcaster.id)
         s_login = payload.broadcaster.name
+        stream_id = getattr(payload, "id", None)
+
         if s_id in twitch_active_messages:
-            logger.info(f"   ℹ️ Ignoring duplicate online event for {s_login}")
-            return
-        logger.info(f"📣 Twitch LIVE: {s_login}")
+            old_stream_id = twitch_active_stream_ids.get(s_id)
+            # If the stream IDs match perfectly, it's a true duplicate event
+            if old_stream_id and stream_id and old_stream_id == stream_id:
+                logger.info(f"   ℹ️ Ignoring duplicate online event for {s_login}")
+                return
+            else:
+                logger.warning(
+                    f"   ⚠️ Stale stream detected for {s_login} (Old: {old_stream_id}, New: {stream_id}). Retiring old message."
+                )
+                # Forcefully end the old message before creating the new one!
+                await self.force_stream_offline(s_id, s_login)
+
+        logger.info(f"📣 Twitch LIVE: {s_login} (Stream: {stream_id})")
         stream_data = None
 
         for attempt in range(3):
@@ -875,6 +923,9 @@ class HybridBot(twitchio.Client):
                 streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
                 if streams:
                     stream_data = streams[0]
+                    # Fallback just in case payload didn't have the ID
+                    if not stream_id and hasattr(stream_data, "id"):
+                        stream_id = stream_data.id
                     break
             except Exception:
                 pass
@@ -893,6 +944,9 @@ class HybridBot(twitchio.Client):
                 embed=embed,
             )
             twitch_active_messages[s_id] = msg
+            if stream_id:
+                twitch_active_stream_ids[s_id] = stream_id
+
             if s_id in twitch_active_tasks:
                 twitch_active_tasks[s_id].cancel()
             twitch_active_tasks[s_id] = asyncio.create_task(
@@ -900,46 +954,22 @@ class HybridBot(twitchio.Client):
             )
             await sync_state_to_dynamodb()
 
-    async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
-        s_id = str(payload.broadcaster.id)
-        if s_id in twitch_active_messages:
-            try:
-                ts = int(datetime.datetime.now().timestamp())
-                embed = discord.Embed(
-                    title=f"⚫ {payload.broadcaster.name} ended.",
-                    description=f"Ended at <t:{ts}:T>.",
-                    color=0x2C2F33,
-                )
-                await twitch_active_messages[s_id].edit(content=None, embed=embed)
-            except:
-                pass
-            del twitch_active_messages[s_id]
-            if s_id in twitch_active_tasks:
-                twitch_active_tasks[s_id].cancel()
-                del twitch_active_tasks[s_id]
-            await sync_state_to_dynamodb()
-
     async def delayed_check(self, s_id: str, s_login: str) -> None:
-        try:  # <-- Move this to the very top!
+        try:
             await asyncio.sleep(3600)
             if s_id not in twitch_active_messages:
                 return
 
             streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
             if not streams:
-                ts = int(datetime.datetime.now().timestamp())
-                embed = discord.Embed(
-                    title=f"⚫ {s_login} ended.",
-                    description=f"Ended at <t:{ts}:T>.",
-                    color=0x2C2F33,
-                )
-                await twitch_active_messages[s_id].edit(content=None, embed=embed)
-                del twitch_active_messages[s_id]
-
-                if s_id in twitch_active_tasks:
-                    del twitch_active_tasks[s_id]
+                await self.force_stream_offline(s_id, s_login)
                 await sync_state_to_dynamodb()
             else:
+                # Update the stream ID from the API fetch just in case it wasn't caught
+                current_stream_id = getattr(streams[0], "id", None)
+                if current_stream_id:
+                    twitch_active_stream_ids[s_id] = current_stream_id
+
                 await twitch_active_messages[s_id].edit(
                     embed=self.build_twitch_embed(s_login, streams[0])
                 )
