@@ -350,6 +350,7 @@ async def sync_state_from_dynamodb(bot_instance):
             await asyncio.gather(*restore_tasks)
 
         logger.info(f"✅ State loaded from DynamoDB. Restored {len(items)} items.")
+        asyncio.create_task(sync_state_to_dynamodb())
     except Exception as e:
         logger.error(f"❌ Failed to load state from DynamoDB: {e}")
 
@@ -367,6 +368,8 @@ async def sync_state_to_dynamodb():
 
         tw_data = {}
         for s_id, msg in twitch_active_messages.items():
+            if msg is None:
+                continue
             login = "Unknown"
             if msg.embeds and msg.embeds[0].url:
                 login = msg.embeds[0].url.split("/")[-1].lower()
@@ -379,6 +382,8 @@ async def sync_state_to_dynamodb():
 
         yt_data = {}
         for vid, msg in youtube_active_messages.items():
+            if msg is None:
+                continue
             yt_data[f"ytlive_{vid}"] = {
                 "video_id": f"ytlive_{vid}",
                 "message_id": str(msg.id),
