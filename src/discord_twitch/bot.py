@@ -725,6 +725,7 @@ class HybridBot(twitchio.Client):
         if video_id in youtube_active_messages:
             del youtube_active_messages[video_id]
         self.remove_youtube_monitor(video_id)
+        await sync_state_to_dynamodb()
 
     def remove_youtube_monitor(self, video_id):
         job_id = f"yt_monitor_{video_id}"
@@ -821,6 +822,7 @@ class HybridBot(twitchio.Client):
                 id=f"yt_monitor_{vid_id}",
                 replace_existing=True,
             )
+            asyncio.create_task(sync_state_to_dynamodb())
 
     def remove_youtube_job(self, video_id, save=True):
         job_id = f"yt_{video_id}"
