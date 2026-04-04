@@ -233,22 +233,26 @@ async def restore_twitch_state(
 
 
 async def restore_youtube_state(bot_instance, channel, vid, msg_id):
+    if vid not in youtube_active_messages:
+        youtube_active_messages[vid] = None
+
     try:
         msg = await channel.fetch_message(msg_id)
-        if vid not in youtube_active_messages:
-            youtube_active_messages[vid] = msg
-            scheduler.add_job(
-                bot_instance.check_youtube_offline,
-                "interval",
-                minutes=30,
-                args=[vid],
-                id=f"yt_monitor_{vid}",
-                replace_existing=True,
-            )
+        youtube_active_messages[vid] = msg
+
+        scheduler.add_job(
+            bot_instance.check_youtube_offline,
+            "interval",
+            minutes=30,
+            args=[vid],
+            id=f"yt_monitor_{vid}",
+            replace_existing=True,
+        )
     except discord.NotFound:
-        pass
+        pass  # Message deleted, but keep lock to prevent duplicates
     except Exception as e:
         logger.error(f"Failed to fetch youtube message {msg_id}: {e}")
+        # Keep lock to prevent duplicates on transient discord errors
 
 
 # --- Helper functions for background threads ---
@@ -628,7 +632,11 @@ class HybridBot(twitchio.Client):
             await sync_state_to_dynamodb()
 
     async def initial_youtube_check(self, video_id, save=True):
-        data = await self.fetch_youtube_data(video_id)
+        try:
+            data = await self.fetch_youtube_data(video_id)
+        except Exception as e:
+            logger.error(f"API Error fetching {video_id}: {e}")
+            return
         if not data:
             return
         snippet = data["snippet"]
@@ -658,7 +666,23 @@ class HybridBot(twitchio.Client):
                 await sync_state_to_dynamodb()
 
     async def check_youtube_status(self, video_id, scheduled_time):
-        data = await self.fetch_youtube_data(video_id)
+        try:
+            data = await self.fetch_youtube_data(video_id)
+        except Exception as e:
+            logger.error(f"API Error sniper {video_id}: {e}")
+            # Reschedule sniper to try again in 90 seconds
+            next_run = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=90)
+            scheduler.add_job(
+                self.check_youtube_status,
+                "date",
+                run_date=next_run,
+                args=[video_id, scheduled_time],
+                id=f"yt_{video_id}",
+                replace_existing=True,
+            )
+            return
         if not data:
             return
         is_live = data["snippet"].get("liveBroadcastContent") == "live"
@@ -695,8 +719,12 @@ class HybridBot(twitchio.Client):
         if video_id not in youtube_active_messages:
             self.remove_youtube_monitor(video_id)
             return
+        try:
+            data = await self.fetch_youtube_data(video_id)
+        except Exception as e:
+            logger.error(f"API Error checking offline status for {video_id}: {e}")
+            return  # Abort check, keep assuming it's live!
 
-        data = await self.fetch_youtube_data(video_id)
         is_live = False
         if data:
             snippet = data.get("snippet")
@@ -708,17 +736,18 @@ class HybridBot(twitchio.Client):
 
         try:
             msg = youtube_active_messages[video_id]
-            old_embed = msg.embeds[0]
-            new_embed = discord.Embed(
-                title=old_embed.title,
-                url=old_embed.url,
-                description="**Stream Ended**",
-                color=0x2C2F33,
-                timestamp=datetime.datetime.now(datetime.timezone.utc),
-            )
-            if old_embed.image:
-                new_embed.set_image(url=old_embed.image.url)
-            await msg.edit(content=None, embed=new_embed)
+            if msg:
+                old_embed = msg.embeds[0]
+                new_embed = discord.Embed(
+                    title=old_embed.title,
+                    url=old_embed.url,
+                    description="**Stream Ended**",
+                    color=0x2C2F33,
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                )
+                if old_embed.image:
+                    new_embed.set_image(url=old_embed.image.url)
+                await msg.edit(content=None, embed=new_embed)
         except Exception as e:
             logger.error(f"Failed to edit offline message for {video_id}: {e}")
 
@@ -745,7 +774,7 @@ class HybridBot(twitchio.Client):
         }
         async with self.session.get(url, params=params) as resp:
             if resp.status != 200:
-                return None
+                raise Exception(f"YouTube API Error {resp.status}")
             js = await resp.json()
             return js["items"][0] if js["items"] else None
 
@@ -776,6 +805,7 @@ class HybridBot(twitchio.Client):
         if vid_id in youtube_active_messages:
             logger.info(f"   ℹ️ Skipping duplicate notification for {vid_id}")
             return
+        youtube_active_messages[vid_id] = None
 
         channel_id = data["snippet"]["channelId"]
         channel_name = YOUTUBE_STREAMERS.get(
@@ -810,19 +840,25 @@ class HybridBot(twitchio.Client):
 
         chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
         if chan:
-            msg = await chan.send(
-                content=f"{title_prefix} **{channel_name}** is LIVE! {url}", embed=embed
-            )
-            youtube_active_messages[vid_id] = msg
-            scheduler.add_job(
-                self.check_youtube_offline,
-                "interval",
-                minutes=30,
-                args=[vid_id],
-                id=f"yt_monitor_{vid_id}",
-                replace_existing=True,
-            )
-            asyncio.create_task(sync_state_to_dynamodb())
+            try:
+                msg = await chan.send(
+                    content=f"{title_prefix} **{channel_name}** is LIVE! {url}",
+                    embed=embed,
+                )
+                youtube_active_messages[vid_id] = msg
+                scheduler.add_job(
+                    self.check_youtube_offline,
+                    "interval",
+                    minutes=30,
+                    args=[vid_id],
+                    id=f"yt_monitor_{vid_id}",
+                    replace_existing=True,
+                )
+                asyncio.create_task(sync_state_to_dynamodb())
+            except Exception as e:
+                # If Discord fails to send, delete the eager lock so the backfill can try again!
+                del youtube_active_messages[vid_id]
+                logger.error(f"Failed to send youtube message to Discord: {e}")
 
     def remove_youtube_job(self, video_id, save=True):
         job_id = f"yt_{video_id}"
