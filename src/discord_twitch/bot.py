@@ -95,7 +95,6 @@ class DiscordTwitchBot(commands.Bot):
     async def setup_hook(self) -> None:
         if twitch_bot:
             self.loop.create_task(twitch_bot.start())
-        autosave_state_task.start()
 
     async def close(self):
         logger.info("🛑 Received shutdown signal. Saving state...")
@@ -217,15 +216,16 @@ def load_config():
 async def restore_twitch_state(
     bot_instance, channel, s_id, login, msg_id, stream_id=""
 ):
+    if s_id not in twitch_active_messages:
+        twitch_active_messages[s_id] = msg_id
     try:
         msg = await channel.fetch_message(msg_id)
-        if s_id not in twitch_active_messages:
-            twitch_active_messages[s_id] = msg
-            if stream_id:
-                twitch_active_stream_ids[s_id] = stream_id
-            twitch_active_tasks[s_id] = asyncio.create_task(
-                bot_instance.delayed_check(s_id, login)
-            )
+        twitch_active_messages[s_id] = msg
+        if stream_id:
+            twitch_active_stream_ids[s_id] = stream_id
+        twitch_active_tasks[s_id] = asyncio.create_task(
+            bot_instance.delayed_check(s_id, login)
+        )
     except discord.NotFound:
         pass  # Message was deleted manually while bot was offline
     except Exception as e:
@@ -234,7 +234,7 @@ async def restore_twitch_state(
 
 async def restore_youtube_state(bot_instance, channel, vid, msg_id):
     if vid not in youtube_active_messages:
-        youtube_active_messages[vid] = None
+        youtube_active_messages[vid] = msg_id
 
     try:
         msg = await channel.fetch_message(msg_id)
@@ -368,27 +368,41 @@ async def sync_state_to_dynamodb():
 
         tw_data = {}
         for s_id, msg in twitch_active_messages.items():
-            if msg is None:
+            if msg is None or msg == 0:
                 continue
-            login = "Unknown"
-            if msg.embeds and msg.embeds[0].url:
-                login = msg.embeds[0].url.split("/")[-1].lower()
+
+            # 👇 ADD THIS BLOCK 👇
+            if isinstance(msg, int):
+                m_id = str(msg)
+                login = "Unknown"
+            else:
+                m_id = str(msg.id)
+                login = "Unknown"
+                if msg.embeds and msg.embeds[0].url:
+                    login = msg.embeds[0].url.split("/")[-1].lower()
+
             tw_data[f"tw_{s_id}"] = {
                 "video_id": f"tw_{s_id}",
-                "message_id": str(msg.id),
+                "message_id": m_id,
                 "login": login,
                 "stream_id": twitch_active_stream_ids.get(s_id, ""),
             }
 
         yt_data = {}
         for vid, msg in youtube_active_messages.items():
-            if msg is None:
+            if msg is None or msg == 0:
                 continue
+
+            # 👇 ADD THIS BLOCK 👇
+            if isinstance(msg, int):
+                m_id = str(msg)
+            else:
+                m_id = str(msg.id)
+
             yt_data[f"ytlive_{vid}"] = {
                 "video_id": f"ytlive_{vid}",
-                "message_id": str(msg.id),
+                "message_id": m_id,
             }
-
         # 2. Pass the safely copied data to the background thread to upload
         await asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data)
         logger.info("☁️  State synced to DynamoDB.")
@@ -434,6 +448,8 @@ class HybridBot(twitchio.Client):
         await self.setup_twitch_subs()
         await self.run_youtube_backfill()
         asyncio.create_task(self.maintain_youtube_subs())
+        if not autosave_state_task.is_running():
+            autosave_state_task.start()
 
     async def close(self):
         if self.session:
@@ -741,7 +757,7 @@ class HybridBot(twitchio.Client):
 
         try:
             msg = youtube_active_messages[video_id]
-            if msg:
+            if msg and not isinstance(msg, int):
                 old_embed = msg.embeds[0]
                 new_embed = discord.Embed(
                     title=old_embed.title,
@@ -784,7 +800,8 @@ class HybridBot(twitchio.Client):
             return js["items"][0] if js["items"] else None
 
     async def force_stream_offline(self, s_id: str, s_login: str):
-        if s_id in twitch_active_messages:
+        msg = twitch_active_messages.get(s_id)
+        if s_id in twitch_active_messages and not isinstance(msg, int):
             try:
                 ts = int(datetime.datetime.now().timestamp())
                 embed = discord.Embed(
@@ -810,7 +827,7 @@ class HybridBot(twitchio.Client):
         if vid_id in youtube_active_messages:
             logger.info(f"   ℹ️ Skipping duplicate notification for {vid_id}")
             return
-        youtube_active_messages[vid_id] = None
+        youtube_active_messages[vid_id] = 0
 
         channel_id = data["snippet"]["channelId"]
         channel_name = YOUTUBE_STREAMERS.get(
@@ -1013,9 +1030,10 @@ class HybridBot(twitchio.Client):
                 if current_stream_id:
                     twitch_active_stream_ids[s_id] = current_stream_id
 
-                await twitch_active_messages[s_id].edit(
-                    embed=self.build_twitch_embed(s_login, streams[0])
-                )
+                msg = twitch_active_messages.get(s_id)
+                if msg and not isinstance(msg, int):  # <--- Add the isinstance check
+                    await msg.edit(embed=self.build_twitch_embed(s_login, streams[0]))
+
                 twitch_active_tasks[s_id] = asyncio.create_task(
                     self.delayed_check(s_id, s_login)
                 )
