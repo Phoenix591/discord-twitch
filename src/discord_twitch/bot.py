@@ -314,6 +314,10 @@ async def sync_state_from_dynamodb(bot_instance):
             if db_key.startswith("yt_"):
                 vid = db_key[3:]
                 s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
+                if s_time < now - datetime.timedelta(
+                    days=2
+                ) or s_time > now + datetime.timedelta(days=45):
+                    continue
                 run_date = s_time - datetime.timedelta(minutes=3)
                 if run_date < now:
                     run_date = now + datetime.timedelta(seconds=5)
@@ -660,19 +664,40 @@ class HybridBot(twitchio.Client):
             return
         if not data:
             return
+
         snippet = data["snippet"]
         live_details = data.get("liveStreamingDetails", {})
         is_live = snippet.get("liveBroadcastContent") == "live"
         scheduled_start = live_details.get("scheduledStartTime")
+        actual_end = live_details.get("actualEndTime")
+
+        # 1. If YouTube confirms it has an actual end time, it's definitively over. Drop it!
+        if actual_end:
+            return
 
         if is_live:
             await self.send_youtube_notification(data)
             self.remove_youtube_job(video_id, save)
         elif scheduled_start:
             dt = datetime.datetime.fromisoformat(scheduled_start.replace("Z", "+00:00"))
+            now = datetime.datetime.now(datetime.timezone.utc)
+
+            # 2. Ignore placeholder "waiting rooms" scheduled more than 45 days out
+            if dt > now + datetime.timedelta(days=45):
+                logger.info(
+                    f"   ⏭️ Skipping {video_id}: Scheduled > 45 days in the future."
+                )
+                return
+
+            # 3. Ignore stale schedules that missed their time by > 2 days and never went live
+            if dt < now - datetime.timedelta(days=2):
+                logger.info(
+                    f"   ⏭️ Skipping {video_id}: Scheduled > 2 days in the past."
+                )
+                return
+
             logger.info(f"   🗓️ Scheduled for {dt}. Queueing Sniper.")
             run_time = dt - datetime.timedelta(minutes=3)
-            now = datetime.datetime.now(datetime.timezone.utc)
             if run_time < now:
                 run_time = now + datetime.timedelta(seconds=10)
             scheduler.add_job(
