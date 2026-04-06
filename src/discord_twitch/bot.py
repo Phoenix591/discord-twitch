@@ -196,6 +196,7 @@ def load_config():
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
     INTERNAL_API_SECRET = config["server"]["internal_api_secret"]
+    logger.info(f"Current twitch secret for troubleshooting: {TWITCH_EVENTSUB_SECRET}")
 
     if "streamers" in config:
         logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
@@ -347,7 +348,6 @@ async def sync_state_from_dynamodb(bot_instance):
                             bot_instance, channel, s_id, login, msg_id, stream_id
                         )
                     )
-
 
         # 3. Wait for ALL Discord messages to be fetched into memory before proceeding
         if restore_tasks:
