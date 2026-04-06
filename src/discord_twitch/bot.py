@@ -311,7 +311,14 @@ async def sync_state_from_dynamodb(bot_instance):
         for item in items:
             db_key = item["video_id"]
 
-            if db_key.startswith("yt_"):
+            if db_key.startswith("ytlive_"):
+                vid = db_key[7:]
+                msg_id = int(item.get("message_id", 0))
+                if msg_id:
+                    restore_tasks.append(
+                        restore_youtube_state(bot_instance, channel, vid, msg_id)
+                    )
+            elif db_key.startswith("yt_"):
                 vid = db_key[3:]
                 s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
                 if s_time < now - datetime.timedelta(
@@ -341,13 +348,6 @@ async def sync_state_from_dynamodb(bot_instance):
                         )
                     )
 
-            elif db_key.startswith("ytlive_"):
-                vid = db_key[7:]
-                msg_id = int(item.get("message_id", 0))
-                if msg_id:
-                    restore_tasks.append(
-                        restore_youtube_state(bot_instance, channel, vid, msg_id)
-                    )
 
         # 3. Wait for ALL Discord messages to be fetched into memory before proceeding
         if restore_tasks:
@@ -837,10 +837,8 @@ class HybridBot(twitchio.Client):
                 await twitch_active_messages[s_id].edit(content=None, embed=embed)
             except Exception as e:
                 logger.debug(f"Could not edit offline message for {s_login}: {e}")
-            del twitch_active_messages[s_id]
-
-        if s_id in twitch_active_stream_ids:
-            del twitch_active_stream_ids[s_id]
+        twitch_active_messages.pop(s_id, None)
+        twitch_active_stream_ids.pop(s_id, None)
 
         if s_id in twitch_active_tasks:
             twitch_active_tasks[s_id].cancel()
