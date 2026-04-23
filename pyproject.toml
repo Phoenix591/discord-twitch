@@ -14,6 +14,7 @@ dependencies = [
 license = { file = "LICENSE" }
 [project.scripts]
 discord-twitch = "discord_twitch.bot:main"
+manage_streamer = "discord_twitch.manage_streamer:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "setuptools_scm>=8.0"]
