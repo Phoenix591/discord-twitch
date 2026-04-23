@@ -161,25 +161,8 @@ def load_config():
     if not secret_path:
         secret_path = "secret.cfg"
 
-    streamers_path = None
-    streamer_candidates = [
-        "/etc/discord-twitch/streamers.cfg",
-        "/usr/local/discord-twitch/streamers.cfg",
-        "streamers.cfg",
-    ]
-    for candidate in streamer_candidates:
-        if os.path.exists(candidate):
-            streamers_path = candidate
-            break
-
-    files_to_read = [
-        f for f in [secret_path, streamers_path] if f and os.path.exists(f)
-    ]
-    if not files_to_read:
-        raise FileNotFoundError("❌ No config files found!")
-
-    if not config.read(files_to_read):
-        raise FileNotFoundError("❌ Failed to parse config files.")
+    if not config.read(secret_path):
+        raise FileNotFoundError(f"❌ Failed to parse secret file: {secret_path}")
 
     DISCORD_TOKEN = config["discord"]["token"]
     DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
@@ -197,21 +180,6 @@ def load_config():
     LOCAL_PORT = int(config["server"]["port"])
     INTERNAL_API_SECRET = config["server"]["internal_api_secret"]
     logger.info(f"Current twitch secret for troubleshooting: {TWITCH_EVENTSUB_SECRET}")
-
-    if "streamers" in config:
-        logger.warning("⚠️ Legacy [streamers] section found. Moving to Twitch.")
-        for s_id, s_name in config["streamers"].items():
-            TWITCH_STREAMERS[str(s_id)] = s_name
-    if "twitch" in config:
-        ignore_keys = ["clientid", "clientsecret", "eventsub_secret"]
-        for s_id, s_name in config["twitch"].items():
-            if s_id.lower() in ignore_keys:
-                continue
-            TWITCH_STREAMERS[str(s_id)] = s_name
-    if "youtube" in config:
-        for c_id, c_name in config["youtube"].items():
-            if c_id not in ["api_key", "backfill_check"]:
-                YOUTUBE_STREAMERS[str(c_id)] = c_name
 
 
 async def restore_twitch_state(
@@ -257,6 +225,16 @@ async def restore_youtube_state(bot_instance, channel, vid, msg_id):
 
 
 # --- Helper functions for background threads ---
+def _db_get_streamers():
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
+        table = dynamodb.Table("discord-twitch-streamers")
+        return table.scan().get("Items", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch streamers from DB: {e}")
+        return None  # Return None on failure to prevent accidental un-subscribes
+
+
 def _db_scan():
     dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
@@ -447,6 +425,7 @@ class HybridBot(twitchio.Client):
         self.session = ClientSession(connector=conn)
 
         await discord_bot.wait_until_ready()
+        await self.reconcile_streamers(initial=True)
         await sync_state_from_dynamodb(self)
         scheduler.start()
         await self.setup_twitch_subs()
@@ -454,6 +433,8 @@ class HybridBot(twitchio.Client):
         asyncio.create_task(self.maintain_youtube_subs())
         if not autosave_state_task.is_running():
             autosave_state_task.start()
+        if not poll_streamers_task.is_running():
+            poll_streamers_task.start()
 
     async def close(self):
         if self.session:
@@ -1110,10 +1091,117 @@ class HybridBot(twitchio.Client):
 
         return embed
 
+    async def reconcile_streamers(self, initial=False):
+        global TWITCH_STREAMERS, YOUTUBE_STREAMERS
+        items = await asyncio.to_thread(_db_get_streamers)
+        if items is None:
+            return  # DB error, abort check to preserve current state
+
+        new_tw, new_yt = {}, {}
+        for item in items:
+            platform = item.get("platform", "").lower()
+            cid = str(item.get("channel_id", ""))
+            name = item.get("display_name", cid)
+            if not cid:
+                continue
+
+            if platform == "twitch":
+                new_tw[cid] = name
+            elif platform == "youtube":
+                new_yt[cid] = name
+
+        if initial:
+            TWITCH_STREAMERS.clear()
+            TWITCH_STREAMERS.update(new_tw)
+            YOUTUBE_STREAMERS.clear()
+            YOUTUBE_STREAMERS.update(new_yt)
+            logger.info(
+                f"📋 Loaded {len(TWITCH_STREAMERS)} Twitch and {len(YOUTUBE_STREAMERS)} YouTube streamers from DB."
+            )
+            return
+
+        added_tw = set(new_tw.keys()) - set(TWITCH_STREAMERS.keys())
+        removed_tw = set(TWITCH_STREAMERS.keys()) - set(new_tw.keys())
+        added_yt = set(new_yt.keys()) - set(YOUTUBE_STREAMERS.keys())
+        removed_yt = set(YOUTUBE_STREAMERS.keys()) - set(new_yt.keys())
+
+        if not any([added_tw, removed_tw, added_yt, removed_yt]):
+            return  # No changes
+
+        TWITCH_STREAMERS.clear()
+        TWITCH_STREAMERS.update(new_tw)
+        YOUTUBE_STREAMERS.clear()
+        YOUTUBE_STREAMERS.update(new_yt)
+
+        # --- TWITCH RECONCILIATION ---
+        if added_tw or removed_tw:
+            logger.info(
+                f"🔄 Twitch streamers changed. Added: {added_tw}, Removed: {removed_tw}"
+            )
+            if removed_tw:
+                # Wiping and resubscribing is the cleanest way to clear old Twitch EventSubs
+                # since we don't cache the active Subscription IDs in memory.
+                logger.info(
+                    "   Wiping Twitch EventSubs and resubscribing due to removals..."
+                )
+                await self.setup_twitch_subs()
+            else:
+                for s_id in added_tw:
+                    try:
+                        await self.subscribe_webhook(
+                            payload=StreamOnlineSubscription(
+                                broadcaster_user_id=s_id, version="1"
+                            ),
+                            callback_url=PUBLIC_URL,
+                        )
+                        await self.subscribe_webhook(
+                            payload=StreamOfflineSubscription(
+                                broadcaster_user_id=s_id, version="1"
+                            ),
+                            callback_url=PUBLIC_URL,
+                        )
+                        logger.info(f"   ➜ Subscribed to Twitch: {new_tw[s_id]}")
+                    except Exception as e:
+                        logger.error(f"   ❌ Failed Twitch Sub for {new_tw[s_id]}: {e}")
+
+        # --- YOUTUBE RECONCILIATION ---
+        if added_yt or removed_yt:
+            logger.info(
+                f"🔄 YouTube streamers changed. Added: {added_yt}, Removed: {removed_yt}"
+            )
+            hub_url = "https://pubsubhubbub.appspot.com/subscribe"
+
+            for cid in added_yt:
+                data = {
+                    "hub.mode": "subscribe",
+                    "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
+                    "hub.callback": f"{PUBLIC_URL}/youtube",
+                    "hub.lease_seconds": 432000,
+                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
+                }
+                asyncio.create_task(self.session.post(hub_url, data=data))
+                logger.info(f"   ➜ Sent Sub request for YouTube: {new_yt[cid]}")
+
+            for cid in removed_yt:
+                data = {
+                    "hub.mode": "unsubscribe",
+                    "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
+                    "hub.callback": f"{PUBLIC_URL}/youtube",
+                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
+                }
+                asyncio.create_task(self.session.post(hub_url, data=data))
+                logger.info(f"   ➜ Sent Unsub request for YouTube: {cid}")
+
 
 @tasks.loop(minutes=90)
 async def autosave_state_task():
     await sync_state_to_dynamodb()
+
+
+@tasks.loop(minutes=10)
+async def poll_streamers_task():
+    if twitch_bot:
+        await twitch_bot.reconcile_streamers(initial=False)
 
 
 def main() -> None:
