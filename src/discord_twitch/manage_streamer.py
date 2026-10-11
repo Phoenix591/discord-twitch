@@ -3,8 +3,8 @@ import boto3
 import argparse
 import sys
 
-DYNAMODB_REGION = "us-east-1"
-TABLE_NAME = "discord-twitch-streamers"
+from discord_twitch.config import dynamodb_settings, load_parser
+from discord_twitch.dynamo import scan_all
 
 
 def main():
@@ -35,19 +35,29 @@ def main():
 
     args = parser.parse_args()
 
-    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
-    table = dynamodb.Table(TABLE_NAME)
+    try:
+        config, _path = load_parser()
+    except FileNotFoundError as e:
+        print(e)
+        sys.exit(1)
+
+    region, _state_table, table_name = dynamodb_settings(config)
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    table = dynamodb.Table(table_name)
 
     # --- LIST LOGIC ---
     if args.list:
         try:
-            response = table.scan()
-            items = response.get("Items", [])
+            items = scan_all(table)
 
             if not items:
-                print("📭 No streamers are currently being tracked.")
+                print(
+                    f"📭 No streamers are currently being tracked in {table_name} ({region})."
+                )
             else:
-                print(f"📋 Currently tracking {len(items)} streamers:\n")
+                print(
+                    f"📋 Currently tracking {len(items)} streamers in {table_name} ({region}):\n"
+                )
 
                 # Sort into platforms and alphabetize by name
                 tw = sorted(
@@ -77,6 +87,7 @@ def main():
 
         except Exception as e:
             print(f"❌ Failed to fetch list: {e}")
+            sys.exit(1)
 
         return  # Exit gracefully after listing
 
@@ -93,6 +104,7 @@ def main():
             print(f"🗑️  Removed {args.platform} streamer with ID {args.id}")
         except Exception as e:
             print(f"❌ Failed to remove item: {e}")
+            sys.exit(1)
 
     # --- ADD LOGIC ---
     else:
@@ -112,6 +124,7 @@ def main():
             print(f"✅ Added {args.platform} streamer: {args.name} ({args.id})")
         except Exception as e:
             print(f"❌ Failed to add item: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

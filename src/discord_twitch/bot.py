@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import discord
-import configparser
 import os
 import sys
 import datetime
@@ -25,6 +24,9 @@ import time
 import hmac
 import hashlib
 import secrets
+
+from discord_twitch.config import dynamodb_settings, load_parser
+from discord_twitch.dynamo import scan_all
 
 INSTANCE_ID = str(uuid.uuid4())
 
@@ -57,8 +59,6 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 # Global Variables
-config = configparser.ConfigParser()
-config.optionxform = str
 twitch_bot = None
 twitch_active_messages = {}
 twitch_active_tasks = {}
@@ -71,6 +71,7 @@ TWITCH_EVENTSUB_SECRET = secrets.token_hex(32)
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
 DYNAMODB_TABLE_NAME = ""
+STREAMERS_TABLE_NAME = "discord-twitch-streamers"
 DISCORD_TOKEN = ""
 DISCORD_CHANNEL_ID = 0
 TWITCH_CLIENT_ID = ""
@@ -137,32 +138,12 @@ discord_bot = DiscordTwitchBot()
 def load_config():
     global DISCORD_TOKEN, DISCORD_CHANNEL_ID, TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET
     global YOUTUBE_API_KEY, YOUTUBE_BACKFILL_CHECK
-    global DYNAMODB_TABLE_NAME, DYNAMODB_REGION, SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
+    global DYNAMODB_TABLE_NAME, DYNAMODB_REGION, STREAMERS_TABLE_NAME
+    global SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
 
-    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-    secret_path = None
-    secret_candidates = []
-    if cred_dir:
-        secret_candidates.append(os.path.join(cred_dir, "secret.cfg"))
-    secret_candidates.extend(
-        [
-            "/etc/discord-twitch/secret.cfg",
-            "/usr/local/discord-twitch/secret.cfg",
-            "secret.cfg",
-        ]
-    )
-
-    for candidate in secret_candidates:
-        if os.path.exists(candidate):
-            secret_path = candidate
-            logger.info(f"🔒 Loading secrets from: {secret_path}")
-            break
-    if not secret_path:
-        secret_path = "secret.cfg"
-
-    if not config.read(secret_path):
-        raise FileNotFoundError(f"❌ Failed to parse secret file: {secret_path}")
+    config, secret_path = load_parser()
+    logger.info(f"🔒 Loading secrets from: {secret_path}")
 
     DISCORD_TOKEN = config["discord"]["token"]
     DISCORD_CHANNEL_ID = int(config["discord"]["channelid"])
@@ -174,7 +155,9 @@ def load_config():
     YOUTUBE_BACKFILL_CHECK = (
         int(config["youtube"].get("backfill_check", 2)) if "youtube" in config else 2
     )
-    DYNAMODB_TABLE_NAME = config["server"].get("dynamodb_table", "discord-twitch-state")
+    DYNAMODB_REGION, DYNAMODB_TABLE_NAME, STREAMERS_TABLE_NAME = dynamodb_settings(
+        config
+    )
     SERVER_DOMAIN = config["server"]["domain"]
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
@@ -225,28 +208,26 @@ async def restore_youtube_state(bot_instance, channel, vid, msg_id):
 
 
 # --- Helper functions for background threads ---
+def _dynamodb_table(name):
+    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
+    return dynamodb.Table(name)
+
+
 def _db_get_streamers():
     try:
-        dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
-        table = dynamodb.Table("discord-twitch-streamers")
-        return table.scan().get("Items", [])
+        return scan_all(_dynamodb_table(STREAMERS_TABLE_NAME))
     except Exception as e:
         logger.error(f"Failed to fetch streamers from DB: {e}")
         return None  # Return None on failure to prevent accidental un-subscribes
 
 
 def _db_scan():
-    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
-    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-    return table.scan().get("Items", [])
+    return scan_all(_dynamodb_table(DYNAMODB_TABLE_NAME))
 
 
 def _db_push(jobs_data, tw_data, yt_data):
-    dynamodb = boto3.resource("dynamodb", region_name=DYNAMODB_REGION)
-    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-
-    response = table.scan()
-    db_items = response.get("Items", [])
+    table = _dynamodb_table(DYNAMODB_TABLE_NAME)
+    db_items = scan_all(table)
     active_db_keys = set()
 
     # Using batch_writer handles throttling and groups requests automatically!
