@@ -8,16 +8,20 @@ dependencies = [
     "discord.py>=2.0.0",
     "twitchio>=3.0.0",
     "aiohttp>=3.7.4",
-    "apscheduler>=3.11.2",
+    # 4.x removes AsyncIOScheduler and add_job. It is still a pre-release.
+    "apscheduler>=3.11.2,<4",
     "boto3>=1.42.39"
 ]
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 [project.scripts]
 discord-twitch = "discord_twitch.bot:main"
 manage_streamer = "discord_twitch.manage_streamer:main"
 
 [build-system]
-requires = ["setuptools>=61.0", "setuptools_scm>=8.0"]
+requires = ["setuptools>=77", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
+# Ansible installs from a source copy that may not include .git.
+fallback_version = "0.0.0"
