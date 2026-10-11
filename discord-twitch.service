@@ -8,7 +8,9 @@ DynamicUser=yes
 User=discord-twitch
 Group=discord-twitch
 
-ExecStart=/usr/local/discord-twitch/bin/python3 /usr/local/discord-twitch/bot.py
+# Console script installed by pip. LogsDirectory creates /var/log/discord-twitch.
+ExecStart=/usr/local/discord-twitch/bin/discord-twitch
+LogsDirectory=discord-twitch
 LoadCredential=secret.cfg:/etc/discord-twitch/secret.cfg
 
 # =======================================================

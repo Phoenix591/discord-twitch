@@ -45,18 +45,11 @@ formatter = logging.Formatter(
     "%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S"
 )
 
-# Systemd Journal Handler (stdout)
+# Systemd Journal Handler (stdout). The log file is attached in main(), once
+# LogsDirectory= exists. Doing it at import crashes under ProtectSystem=strict.
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
-
-# File for cloudwatch etc
-# systemd's LogsDirectory=discord-twitch creates this folder and gives us write access
-file_handler = logging.FileHandler(
-    "/var/log/discord-twitch/discord-twitch.log", encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
 
 # Global Variables
 twitch_bot = None
@@ -64,9 +57,15 @@ twitch_active_messages = {}
 twitch_active_tasks = {}
 twitch_active_stream_ids = {}
 youtube_active_messages = {}
-scheduler = AsyncIOScheduler()
-YOUTUBE_WEBHOOK_SECRET = secrets.token_hex(32)
-TWITCH_EVENTSUB_SECRET = secrets.token_hex(32)
+_twitch_announcing = set()
+# misfire_grace_time of 1 second drops date jobs that are already due when start()
+# runs. None means run them no matter how late they are.
+scheduler = AsyncIOScheduler(
+    job_defaults={"misfire_grace_time": None, "coalesce": True}
+)
+YOUTUBE_WEBHOOK_SECRET = ""
+TWITCH_EVENTSUB_SECRET = ""
+_sync_lock = asyncio.Lock()
 
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
@@ -90,7 +89,6 @@ INTERNAL_API_SECRET = ""
 class DiscordTwitchBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
@@ -124,11 +122,6 @@ class DiscordTwitchBot(commands.Bot):
             logger.error(f"Error closing Discord bot: {e}")
 
         logger.info("👋 Exiting successfully (End of close sequence)")
-        # Force immediate success exit, bypassing asyncio's fragile background thread teardown
-        for handler in logging.root.handlers:
-            handler.flush()
-        sys.stdout.flush()
-        os._exit(0)
 
 
 # Create the global instance using the new class
@@ -141,6 +134,7 @@ def load_config():
     global DYNAMODB_TABLE_NAME, DYNAMODB_REGION, STREAMERS_TABLE_NAME
     global SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
+    global YOUTUBE_WEBHOOK_SECRET, TWITCH_EVENTSUB_SECRET
 
     config, secret_path = load_parser()
     logger.info(f"🔒 Loading secrets from: {secret_path}")
@@ -162,7 +156,19 @@ def load_config():
     PUBLIC_URL = config["server"]["public_url"]
     LOCAL_PORT = int(config["server"]["port"])
     INTERNAL_API_SECRET = config["server"]["internal_api_secret"]
-    logger.info(f"Current twitch secret for troubleshooting: {TWITCH_EVENTSUB_SECRET}")
+
+    yt_secret = ""
+    tw_secret = ""
+    if "youtube" in config:
+        yt_secret = config["youtube"].get("webhook_secret", "").strip()
+    if "twitch" in config:
+        tw_secret = config["twitch"].get("eventsub_secret", "").strip()
+    YOUTUBE_WEBHOOK_SECRET = yt_secret or secrets.token_hex(32)
+    TWITCH_EVENTSUB_SECRET = tw_secret or secrets.token_hex(32)
+    if not tw_secret:
+        logger.info("No EventSub secret in config; generated one for this process.")
+    if not yt_secret:
+        logger.info("No YouTube webhook secret in config; generated one for this process.")
 
 
 async def restore_twitch_state(
@@ -176,12 +182,17 @@ async def restore_twitch_state(
         if stream_id:
             twitch_active_stream_ids[s_id] = stream_id
         twitch_active_tasks[s_id] = asyncio.create_task(
-            bot_instance.delayed_check(s_id, login)
+            bot_instance.delayed_check(s_id, login, delay=0)
         )
     except discord.NotFound:
-        pass  # Message was deleted manually while bot was offline
+        # Message was deleted. Drop the lock so the live sweep can post again.
+        twitch_active_messages.pop(s_id, None)
+        twitch_active_stream_ids.pop(s_id, None)
     except Exception as e:
         logger.error(f"Failed to fetch twitch message {msg_id}: {e}")
+        twitch_active_tasks[s_id] = asyncio.create_task(
+            bot_instance.delayed_check(s_id, login, delay=0)
+        )
 
 
 async def restore_youtube_state(bot_instance, channel, vid, msg_id):
@@ -191,20 +202,14 @@ async def restore_youtube_state(bot_instance, channel, vid, msg_id):
     try:
         msg = await channel.fetch_message(msg_id)
         youtube_active_messages[vid] = msg
-
-        scheduler.add_job(
-            bot_instance.check_youtube_offline,
-            "interval",
-            minutes=30,
-            args=[vid],
-            id=f"yt_monitor_{vid}",
-            replace_existing=True,
-        )
+        bot_instance.schedule_youtube_monitor(vid, immediate=True)
     except discord.NotFound:
-        pass  # Message deleted, but keep lock to prevent duplicates
+        # Message was deleted. Keep the id so we do not announce it again,
+        # and still watch for the stream ending.
+        bot_instance.schedule_youtube_monitor(vid, immediate=True)
     except Exception as e:
         logger.error(f"Failed to fetch youtube message {msg_id}: {e}")
-        # Keep lock to prevent duplicates on transient discord errors
+        bot_instance.schedule_youtube_monitor(vid, immediate=True)
 
 
 # --- Helper functions for background threads ---
@@ -225,10 +230,11 @@ def _db_scan():
     return scan_all(_dynamodb_table(DYNAMODB_TABLE_NAME))
 
 
-def _db_push(jobs_data, tw_data, yt_data):
+def _db_push(jobs_data, tw_data, yt_data, pending_ids=None):
     table = _dynamodb_table(DYNAMODB_TABLE_NAME)
     db_items = scan_all(table)
     active_db_keys = set()
+    pending_ids = pending_ids or set()
 
     # Using batch_writer handles throttling and groups requests automatically!
     with table.batch_writer() as batch:
@@ -245,8 +251,25 @@ def _db_push(jobs_data, tw_data, yt_data):
             batch.put_item(Item=item_data)
 
         for item in db_items:
-            if item["video_id"] not in active_db_keys:
-                batch.delete_item(Key={"video_id": item["video_id"]})
+            video_id = item["video_id"]
+            if video_id not in active_db_keys and video_id not in pending_ids:
+                batch.delete_item(Key={"video_id": video_id})
+
+
+def _helix_stream_is_live(stream):
+    # Helix uses "live", or "" when the type could not be determined.
+    return getattr(stream, "type", "live") in ("live", "")
+
+
+async def discord_channel():
+    channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        return channel
+    try:
+        return await discord_bot.fetch_channel(DISCORD_CHANNEL_ID)
+    except Exception as e:
+        logger.error(f"❌ Could not fetch Discord channel: {e}")
+        return None
 
 
 # --- Main Async Sync Functions ---
@@ -257,13 +280,10 @@ async def sync_state_from_dynamodb(bot_instance):
         now = datetime.datetime.now(datetime.timezone.utc)
 
         # 1. Bypass the cache to guarantee we get the channel
-        channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+        channel = await discord_channel()
         if not channel:
-            try:
-                channel = await discord_bot.fetch_channel(DISCORD_CHANNEL_ID)
-            except Exception as e:
-                logger.error(f"❌ Critical Error: Could not fetch Discord channel: {e}")
-                return  # Abort sync! Do not proceed with an empty memory state!
+            logger.error("❌ Critical Error: Could not fetch Discord channel")
+            return  # Abort sync! Do not proceed with an empty memory state!
 
         # 2. Collect all restoration tasks so we can wait for them
         restore_tasks = []
@@ -288,14 +308,7 @@ async def sync_state_from_dynamodb(bot_instance):
                 run_date = s_time - datetime.timedelta(minutes=3)
                 if run_date < now:
                     run_date = now + datetime.timedelta(seconds=5)
-                scheduler.add_job(
-                    bot_instance.check_youtube_status,
-                    "date",
-                    run_date=run_date,
-                    args=[vid, s_time],
-                    id=f"yt_{vid}",
-                    replace_existing=True,
-                )
+                bot_instance.schedule_youtube_sniper(vid, s_time, run_date)
             elif db_key.startswith("tw_"):
                 s_id = db_key[3:]
                 login = item.get("login", "")
@@ -313,64 +326,68 @@ async def sync_state_from_dynamodb(bot_instance):
             await asyncio.gather(*restore_tasks)
 
         logger.info(f"✅ State loaded from DynamoDB. Restored {len(items)} items.")
-        asyncio.create_task(sync_state_to_dynamodb())
+        await sync_state_to_dynamodb()
     except Exception as e:
         logger.error(f"❌ Failed to load state from DynamoDB: {e}")
 
 
 async def sync_state_to_dynamodb():
-    try:
-        # 1. Safely snapshot all memory states on the main thread
-        jobs_data = {}
-        for job in scheduler.get_jobs():
-            if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
-                try:
-                    jobs_data[f"yt_{job.args[0]}"] = job.args[1].isoformat()
-                except IndexError:
-                    pass
+    async with _sync_lock:
+        try:
+            # Snapshot with no await. Placeholder 0 is an in-flight send: keep the
+            # existing row, and do not overwrite it with incomplete data.
+            jobs_data = {}
+            for job in scheduler.get_jobs():
+                if job.id.startswith("yt_") and not job.id.startswith("yt_monitor_"):
+                    try:
+                        jobs_data[f"yt_{job.args[0]}"] = job.args[1].isoformat()
+                    except IndexError:
+                        pass
 
-        tw_data = {}
-        for s_id, msg in twitch_active_messages.items():
-            if msg is None or msg == 0:
-                continue
+            pending_ids = set()
+            tw_data = {}
+            for s_id, msg in list(twitch_active_messages.items()):
+                if msg is None or msg == 0:
+                    pending_ids.add(f"tw_{s_id}")
+                    continue
 
-            # 👇 ADD THIS BLOCK 👇
-            if isinstance(msg, int):
-                m_id = str(msg)
-                login = "Unknown"
-            else:
-                m_id = str(msg.id)
-                login = "Unknown"
-                if msg.embeds and msg.embeds[0].url:
-                    login = msg.embeds[0].url.split("/")[-1].lower()
+                if isinstance(msg, int):
+                    m_id = str(msg)
+                    login = "Unknown"
+                else:
+                    m_id = str(msg.id)
+                    login = "Unknown"
+                    if msg.embeds and msg.embeds[0].url:
+                        login = msg.embeds[0].url.split("/")[-1].lower()
 
-            tw_data[f"tw_{s_id}"] = {
-                "video_id": f"tw_{s_id}",
-                "message_id": m_id,
-                "login": login,
-                "stream_id": twitch_active_stream_ids.get(s_id, ""),
-            }
+                tw_data[f"tw_{s_id}"] = {
+                    "video_id": f"tw_{s_id}",
+                    "message_id": m_id,
+                    "login": login,
+                    "stream_id": twitch_active_stream_ids.get(s_id, ""),
+                }
 
-        yt_data = {}
-        for vid, msg in youtube_active_messages.items():
-            if msg is None or msg == 0:
-                continue
+            yt_data = {}
+            for vid, msg in list(youtube_active_messages.items()):
+                if msg is None or msg == 0:
+                    pending_ids.add(f"ytlive_{vid}")
+                    continue
 
-            # 👇 ADD THIS BLOCK 👇
-            if isinstance(msg, int):
-                m_id = str(msg)
-            else:
-                m_id = str(msg.id)
+                if isinstance(msg, int):
+                    m_id = str(msg)
+                else:
+                    m_id = str(msg.id)
 
-            yt_data[f"ytlive_{vid}"] = {
-                "video_id": f"ytlive_{vid}",
-                "message_id": m_id,
-            }
-        # 2. Pass the safely copied data to the background thread to upload
-        await asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data)
-        logger.info("☁️  State synced to DynamoDB.")
-    except Exception as e:
-        logger.error(f"❌ DynamoDB Sync failed: {e}")
+                yt_data[f"ytlive_{vid}"] = {
+                    "video_id": f"ytlive_{vid}",
+                    "message_id": m_id,
+                }
+            await asyncio.to_thread(
+                _db_push, jobs_data, tw_data, yt_data, pending_ids
+            )
+            logger.info("☁️  State synced to DynamoDB.")
+        except Exception as e:
+            logger.error(f"❌ DynamoDB Sync failed: {e}")
 
 
 # Main Hybrid Bot Class
@@ -408,8 +425,10 @@ class HybridBot(twitchio.Client):
         await discord_bot.wait_until_ready()
         await self.reconcile_streamers(initial=True)
         await sync_state_from_dynamodb(self)
-        scheduler.start()
+        if not scheduler.running:
+            scheduler.start()
         await self.setup_twitch_subs()
+        await self.announce_current_twitch_streams()
         await self.run_youtube_backfill()
         asyncio.create_task(self.maintain_youtube_subs())
         if not autosave_state_task.is_running():
@@ -421,6 +440,52 @@ class HybridBot(twitchio.Client):
         if self.session:
             await self.session.close()
         await super().close()
+
+    def schedule_youtube_sniper(self, video_id, scheduled_time, run_time):
+        scheduler.add_job(
+            self.check_youtube_status,
+            "date",
+            run_date=run_time,
+            args=[video_id, scheduled_time],
+            id=f"yt_{video_id}",
+            replace_existing=True,
+        )
+
+    def schedule_youtube_monitor(self, video_id, immediate=False):
+        kwargs = {}
+        if immediate:
+            # A restored interval otherwise waits the full 30 minutes.
+            kwargs["next_run_time"] = datetime.datetime.now(datetime.timezone.utc)
+        scheduler.add_job(
+            self.check_youtube_offline,
+            "interval",
+            minutes=30,
+            args=[video_id],
+            id=f"yt_monitor_{video_id}",
+            replace_existing=True,
+            **kwargs,
+        )
+
+    async def _youtube_hub(self, mode, channel_id):
+        if not self.session:
+            return False, "HTTP session is not open"
+        data = {
+            "hub.mode": mode,
+            "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={channel_id}",
+            "hub.callback": f"{PUBLIC_URL}/youtube",
+            "hub.secret": YOUTUBE_WEBHOOK_SECRET,
+        }
+        if mode == "subscribe":
+            data["hub.lease_seconds"] = 432000
+        try:
+            async with self.session.post(
+                "https://pubsubhubbub.appspot.com/subscribe", data=data
+            ) as resp:
+                if resp.status >= 400:
+                    return False, f"HTTP {resp.status}"
+                return True, ""
+        except Exception as e:
+            return False, str(e)
 
     async def internal_takeover_handler(self, request):
         signature = request.headers.get("X-Signature")
@@ -466,11 +531,11 @@ class HybridBot(twitchio.Client):
         # Wait 1 second to ensure the HTTP 200 OK is sent back to the client
         await asyncio.sleep(1)
 
-        # Trigger your existing clean shutdown logic (Syncs S3 and closes Discord)
+        # Saves state to DynamoDB and closes Discord
         await discord_bot.close()
 
         # Exit with code 0 so systemd's 'Restart=on-failure' leaves this dead process in the grave
-        os._exit(0)
+        _exit(0)
 
     async def youtube_webhook_handler(self, request):
         if request.method == "GET":
@@ -530,7 +595,7 @@ class HybridBot(twitchio.Client):
             "User-Agent": "Mozilla/5.0 (compatible; DiscordTwitchBot/2.0; +http://discordapp.com)"
         }
 
-        for channel_id in YOUTUBE_STREAMERS:
+        for channel_id in list(YOUTUBE_STREAMERS):
             playlist_id = None
             try:
                 url = "https://www.googleapis.com/youtube/v3/channels"
@@ -625,9 +690,18 @@ class HybridBot(twitchio.Client):
             logger.error(f"API Error fetching {video_id}: {e}")
             return
         if not data:
+            await self.remove_youtube_job(video_id, save)
             return
 
         snippet = data["snippet"]
+        channel_id = snippet.get("channelId")
+        if channel_id not in YOUTUBE_STREAMERS:
+            logger.info(
+                f"   ℹ️ Skipping {video_id}: channel {channel_id} is no longer tracked."
+            )
+            await self.remove_youtube_job(video_id, save)
+            return
+
         live_details = data.get("liveStreamingDetails", {})
         is_live = snippet.get("liveBroadcastContent") == "live"
         scheduled_start = live_details.get("scheduledStartTime")
@@ -635,11 +709,12 @@ class HybridBot(twitchio.Client):
 
         # 1. If YouTube confirms it has an actual end time, it's definitively over. Drop it!
         if actual_end:
+            await self.remove_youtube_job(video_id, save)
             return
 
         if is_live:
             await self.send_youtube_notification(data)
-            self.remove_youtube_job(video_id, save)
+            await self.remove_youtube_job(video_id, save)
         elif scheduled_start:
             dt = datetime.datetime.fromisoformat(scheduled_start.replace("Z", "+00:00"))
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -649,6 +724,7 @@ class HybridBot(twitchio.Client):
                 logger.info(
                     f"   ⏭️ Skipping {video_id}: Scheduled > 45 days in the future."
                 )
+                await self.remove_youtube_job(video_id, save)
                 return
 
             # 3. Ignore stale schedules that missed their time by > 2 days and never went live
@@ -656,45 +732,47 @@ class HybridBot(twitchio.Client):
                 logger.info(
                     f"   ⏭️ Skipping {video_id}: Scheduled > 2 days in the past."
                 )
+                await self.remove_youtube_job(video_id, save)
                 return
 
             logger.info(f"   🗓️ Scheduled for {dt}. Queueing Sniper.")
             run_time = dt - datetime.timedelta(minutes=3)
             if run_time < now:
                 run_time = now + datetime.timedelta(seconds=10)
-            scheduler.add_job(
-                self.check_youtube_status,
-                "date",
-                run_date=run_time,
-                args=[video_id, dt],
-                id=f"yt_{video_id}",
-                replace_existing=True,
-            )
+            self.schedule_youtube_sniper(video_id, dt, run_time)
             if save:
                 await sync_state_to_dynamodb()
 
     async def check_youtube_status(self, video_id, scheduled_time):
+        now = datetime.datetime.now(datetime.timezone.utc)
         try:
             data = await self.fetch_youtube_data(video_id)
         except Exception as e:
             logger.error(f"API Error sniper {video_id}: {e}")
-            # Reschedule sniper to try again in 90 seconds
-            next_run = datetime.datetime.now(
-                datetime.timezone.utc
-            ) + datetime.timedelta(seconds=90)
-            scheduler.add_job(
-                self.check_youtube_status,
-                "date",
-                run_date=next_run,
-                args=[video_id, scheduled_time],
-                id=f"yt_{video_id}",
-                replace_existing=True,
+            # The date job has already been consumed. Give up once the old window
+            # has passed so a dead video cannot poll every 90 seconds forever.
+            if now >= scheduled_time + datetime.timedelta(minutes=21):
+                logger.info(f"   🛑 Giving up on {video_id} after API errors.")
+                await sync_state_to_dynamodb()
+                return
+            self.schedule_youtube_sniper(
+                video_id, scheduled_time, now + datetime.timedelta(seconds=90)
             )
             return
         if not data:
+            logger.info(f"   🛑 Giving up on {video_id} (video not found).")
+            await sync_state_to_dynamodb()
             return
+
+        channel_id = data["snippet"].get("channelId")
+        if channel_id not in YOUTUBE_STREAMERS:
+            logger.info(
+                f"   🛑 Giving up on {video_id}: channel {channel_id} is no longer tracked."
+            )
+            await sync_state_to_dynamodb()
+            return
+
         is_live = data["snippet"].get("liveBroadcastContent") == "live"
-        now = datetime.datetime.now(datetime.timezone.utc)
 
         if is_live:
             logger.info(f"🎯 Sniper Hit! {video_id} is LIVE.")
@@ -702,22 +780,12 @@ class HybridBot(twitchio.Client):
             return
 
         if now < (scheduled_time + datetime.timedelta(minutes=3)):
-            next_run = now + datetime.timedelta(seconds=90)
-            scheduler.add_job(
-                self.check_youtube_status,
-                "date",
-                run_date=next_run,
-                args=[video_id, scheduled_time],
-                id=f"yt_{video_id}",
+            self.schedule_youtube_sniper(
+                video_id, scheduled_time, now + datetime.timedelta(seconds=90)
             )
         elif now < (scheduled_time + datetime.timedelta(minutes=21)):
-            next_run = now + datetime.timedelta(minutes=3)
-            scheduler.add_job(
-                self.check_youtube_status,
-                "date",
-                run_date=next_run,
-                args=[video_id, scheduled_time],
-                id=f"yt_{video_id}",
+            self.schedule_youtube_sniper(
+                video_id, scheduled_time, now + datetime.timedelta(minutes=3)
             )
         else:
             logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
@@ -802,123 +870,112 @@ class HybridBot(twitchio.Client):
         twitch_active_messages.pop(s_id, None)
         twitch_active_stream_ids.pop(s_id, None)
 
-        if s_id in twitch_active_tasks:
-            twitch_active_tasks[s_id].cancel()
-            del twitch_active_tasks[s_id]
+        # delayed_check calls this and then syncs. Cancelling the current task
+        # would drop that sync on the floor.
+        task = twitch_active_tasks.pop(s_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
 
     async def send_youtube_notification(self, data):
         vid_id = data["id"]
+        channel_id = data["snippet"]["channelId"]
+        if channel_id not in YOUTUBE_STREAMERS:
+            logger.info(
+                f"   ℹ️ Skipping {vid_id}: channel {channel_id} is no longer tracked."
+            )
+            return
 
         if vid_id in youtube_active_messages:
             logger.info(f"   ℹ️ Skipping duplicate notification for {vid_id}")
             return
         youtube_active_messages[vid_id] = 0
+        try:
+            channel_name = YOUTUBE_STREAMERS.get(
+                channel_id, data["snippet"]["channelTitle"]
+            )
+            url = f"https://www.youtube.com/watch?v={vid_id}"
 
-        channel_id = data["snippet"]["channelId"]
-        channel_name = YOUTUBE_STREAMERS.get(
-            channel_id, data["snippet"]["channelTitle"]
-        )
-        url = f"https://www.youtube.com/watch?v={vid_id}"
+            stats = data.get("statistics", {})
+            is_members_only = "viewCount" not in stats
 
-        stats = data.get("statistics", {})
-        is_members_only = "viewCount" not in stats
+            if is_members_only:
+                title_prefix = "( MEMBERS ONLY )"
+                desc = f"🔒 **{channel_name}** is live for **MEMBERS ONLY**!"
+                color = 0xFFD700  # Gold
+            else:
+                title_prefix = "🔴"
+                desc = f"**{channel_name}** is LIVE on YouTube!"
+                color = 0xFF0000  # Red
 
-        if is_members_only:
-            title_prefix = "( MEMBERS ONLY )"
-            desc = f"🔒 **{channel_name}** is live for **MEMBERS ONLY**!"
-            color = 0xFFD700  # Gold
-        else:
-            title_prefix = "🔴"
-            desc = f"**{channel_name}** is LIVE on YouTube!"
-            color = 0xFF0000  # Red
+            embed = discord.Embed(
+                title=f"{title_prefix} {data['snippet']['title']}",
+                url=url,
+                description=desc,
+                color=color,
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            thumbs = data["snippet"]["thumbnails"]
+            thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))[
+                "url"
+            ]
+            embed.set_image(url=thumb_url)
 
-        embed = discord.Embed(
-            title=f"{title_prefix} {data['snippet']['title']}",
-            url=url,
-            description=desc,
-            color=color,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
-        thumbs = data["snippet"]["thumbnails"]
-        thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))[
-            "url"
-        ]
-        embed.set_image(url=thumb_url)
+            chan = await discord_channel()
+            if not chan:
+                youtube_active_messages.pop(vid_id, None)
+                logger.error("Failed to send youtube message: Discord channel unavailable")
+                return
+            msg = await chan.send(
+                content=f"{title_prefix} **{channel_name}** is LIVE! {url}",
+                embed=embed,
+            )
+            youtube_active_messages[vid_id] = msg
+            self.schedule_youtube_monitor(vid_id, immediate=False)
+            await sync_state_to_dynamodb()
+        except Exception as e:
+            # If Discord fails to send, delete the eager lock so the backfill can try again!
+            youtube_active_messages.pop(vid_id, None)
+            logger.error(f"Failed to send youtube message to Discord: {e}")
 
-        chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if chan:
-            try:
-                msg = await chan.send(
-                    content=f"{title_prefix} **{channel_name}** is LIVE! {url}",
-                    embed=embed,
-                )
-                youtube_active_messages[vid_id] = msg
-                scheduler.add_job(
-                    self.check_youtube_offline,
-                    "interval",
-                    minutes=30,
-                    args=[vid_id],
-                    id=f"yt_monitor_{vid_id}",
-                    replace_existing=True,
-                )
-                asyncio.create_task(sync_state_to_dynamodb())
-            except Exception as e:
-                # If Discord fails to send, delete the eager lock so the backfill can try again!
-                del youtube_active_messages[vid_id]
-                logger.error(f"Failed to send youtube message to Discord: {e}")
-
-    def remove_youtube_job(self, video_id, save=True):
+    async def remove_youtube_job(self, video_id, save=True):
         job_id = f"yt_{video_id}"
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
             if save:
-                asyncio.create_task(sync_state_to_dynamodb())
+                await sync_state_to_dynamodb()
 
     async def maintain_youtube_subs(self):
         await discord_bot.wait_until_ready()
-        hub_url = "https://pubsubhubbub.appspot.com/subscribe"
         while not discord_bot.is_closed():
             logger.info("📡 Renewing YouTube WebSub Leases...")
-            for cid in YOUTUBE_STREAMERS:
-                data = {
-                    "hub.mode": "subscribe",
-                    "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
-                    "hub.callback": f"{PUBLIC_URL}/youtube",
-                    "hub.lease_seconds": 432000,
-                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
-                }
+            any_failed = False
+            for cid, name in list(YOUTUBE_STREAMERS.items()):
+                ok = False
+                err = ""
                 for attempt in range(4):
-                    try:
-                        if self.session:
-                            async with self.session.post(hub_url, data=data) as resp:
-                                if resp.status >= 400:
-                                    logger.error(
-                                        f"   ❌ Failed sub for {cid} (HTTP {resp.status}) - Attempt {attempt + 1}/4"
-                                    )
-                                    if attempt < 3:
-                                        # Sleep for 15 seconds before retrying
-                                        await asyncio.sleep(15)
-                                else:
-                                    logger.info(
-                                        f"   ➜ Subscribed to YouTube: {YOUTUBE_STREAMERS[cid]} ({cid})"
-                                    )
-                                    break  # Success, break out of the retry loop
-                    except Exception as e:
-                        logger.error(
-                            f"   ❌ Failed sub for {cid} ({e}) - Attempt {attempt + 1}/4"
-                        )
-                        if attempt < 3:
-                            await asyncio.sleep(15)
-            await asyncio.sleep(345600)
+                    ok, err = await self._youtube_hub("subscribe", cid)
+                    if ok:
+                        logger.info(f"   ➜ Subscribed to YouTube: {name} ({cid})")
+                        break
+                    logger.error(
+                        f"   ❌ Failed sub for {cid} ({err}) - Attempt {attempt + 1}/4"
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(15)
+                if not ok:
+                    any_failed = True
+            # A failed lease should be retried within the hour, not in four days.
+            await asyncio.sleep(3600 if any_failed else 345600)
 
     # Twitch Logic
     async def setup_twitch_subs(self):
         try:
+            # This clears every EventSub subscription on the client id, not just ours.
             await self.delete_all_eventsub_subscriptions()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to delete existing EventSub subscriptions: {e}")
         logger.info(f"📋 Subscribing {len(TWITCH_STREAMERS)} Twitch channels...")
-        for s_id, s_name in TWITCH_STREAMERS.items():
+        for s_id, s_name in list(TWITCH_STREAMERS.items()):
             try:
                 await self.subscribe_webhook(
                     payload=StreamOnlineSubscription(
@@ -938,14 +995,62 @@ class HybridBot(twitchio.Client):
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
         s_id = str(payload.broadcaster.id)
-        s_login = payload.broadcaster.name
+        s_login = payload.broadcaster.name or TWITCH_STREAMERS.get(s_id, s_id)
         await self.force_stream_offline(s_id, s_login)
         await sync_state_to_dynamodb()
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
         s_id = str(payload.broadcaster.id)
-        s_login = payload.broadcaster.name
-        stream_id = getattr(payload, "id", None)
+        s_login = payload.broadcaster.name or TWITCH_STREAMERS.get(s_id, s_id)
+        # Premieres, reruns, playlists, and watch parties are not a live broadcast.
+        if payload.type != "live":
+            logger.info(f"   ℹ️ Ignoring {payload.type} event for {s_login}")
+            return
+        await self._handle_twitch_online(s_id, s_login, payload.id)
+
+    async def announce_current_twitch_streams(self):
+        ids = list(TWITCH_STREAMERS.keys())
+        if not ids:
+            return
+        logger.info(
+            f"🔎 Checking {len(ids)} Twitch channels for streams already live..."
+        )
+        for start in range(0, len(ids), 100):
+            chunk = ids[start : start + 100]
+            try:
+                async for stream in self.fetch_streams(user_ids=chunk, first=100):
+                    if not _helix_stream_is_live(stream):
+                        logger.info(
+                            f"   ℹ️ Skipping Twitch stream {stream.id} ({stream.type})"
+                        )
+                        continue
+                    s_id = str(stream.user.id)
+                    if s_id not in TWITCH_STREAMERS:
+                        continue
+                    if s_id in twitch_active_messages:
+                        if stream.id:
+                            twitch_active_stream_ids[s_id] = str(stream.id)
+                        continue
+                    s_login = stream.user.name or TWITCH_STREAMERS.get(s_id, s_id)
+                    await self._handle_twitch_online(
+                        s_id, s_login, stream.id, stream_data=stream
+                    )
+            except Exception as e:
+                logger.error(f"Failed to sweep live Twitch streams: {e}")
+
+    async def _handle_twitch_online(self, s_id, s_login, stream_id, stream_data=None):
+        if s_id in _twitch_announcing:
+            logger.info(f"   ℹ️ Announcement already in flight for {s_login}")
+            return
+        _twitch_announcing.add(s_id)
+        try:
+            await self._announce_twitch(s_id, s_login, stream_id, stream_data)
+        finally:
+            _twitch_announcing.discard(s_id)
+
+    async def _announce_twitch(self, s_id, s_login, stream_id, stream_data=None):
+        if stream_id is not None:
+            stream_id = str(stream_id)
 
         if s_id in twitch_active_messages:
             old_stream_id = twitch_active_stream_ids.get(s_id)
@@ -953,59 +1058,85 @@ class HybridBot(twitchio.Client):
             if old_stream_id and stream_id and old_stream_id == stream_id:
                 logger.info(f"   ℹ️ Ignoring duplicate online event for {s_login}")
                 return
-            else:
-                logger.warning(
-                    f"   ⚠️ Stale stream detected for {s_login} (Old: {old_stream_id}, New: {stream_id}). Retiring old message."
-                )
-                # Forcefully end the old message before creating the new one!
-                await self.force_stream_offline(s_id, s_login)
+            if twitch_active_messages.get(s_id) == 0 and not old_stream_id:
+                logger.info(f"   ℹ️ Announcement already in flight for {s_login}")
+                return
+            logger.warning(
+                f"   ⚠️ Stale stream detected for {s_login} (Old: {old_stream_id}, New: {stream_id}). Retiring old message."
+            )
+            await self.force_stream_offline(s_id, s_login)
+
+        # Hold the slot before any further await so a duplicate event cannot
+        # announce the same stream twice.
+        twitch_active_messages[s_id] = 0
+
+        if stream_data is None:
+            for attempt in range(3):
+                try:
+                    streams = [
+                        s
+                        async for s in self.fetch_streams(user_ids=[s_id])
+                        if _helix_stream_is_live(s)
+                    ]
+                    if streams:
+                        stream_data = streams[0]
+                        if not stream_id and getattr(stream_data, "id", None):
+                            stream_id = str(stream_data.id)
+                        break
+                except Exception:
+                    pass
+
+                if attempt < 2:
+                    logger.info(
+                        f"   ⏳ Stream data unavailable, retrying in 5s... ({attempt+1}/3)"
+                    )
+                    await asyncio.sleep(5)
 
         logger.info(f"📣 Twitch LIVE: {s_login} (Stream: {stream_id})")
-        stream_data = None
-
-        for attempt in range(3):
-            try:
-                streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
-                if streams:
-                    stream_data = streams[0]
-                    # Fallback just in case payload didn't have the ID
-                    if not stream_id and hasattr(stream_data, "id"):
-                        stream_id = stream_data.id
-                    break
-            except Exception:
-                pass
-
-            if attempt < 2:
-                logger.info(
-                    f"   ⏳ Stream data unavailable, retrying in 5s... ({attempt+1}/3)"
-                )
-                await asyncio.sleep(5)
-
         embed = self.build_twitch_embed(s_login, stream_data)
-        chan = discord_bot.get_channel(DISCORD_CHANNEL_ID)
-        if chan:
+        chan = await discord_channel()
+        if not chan:
+            twitch_active_messages.pop(s_id, None)
+            twitch_active_stream_ids.pop(s_id, None)
+            logger.error(
+                f"Failed to announce {s_login}: Discord channel unavailable"
+            )
+            return
+        try:
             msg = await chan.send(
                 content=f"🔴 **{s_login}** is LIVE! https://twitch.tv/{s_login}",
                 embed=embed,
             )
-            twitch_active_messages[s_id] = msg
-            if stream_id:
-                twitch_active_stream_ids[s_id] = stream_id
+        except Exception as e:
+            twitch_active_messages.pop(s_id, None)
+            twitch_active_stream_ids.pop(s_id, None)
+            logger.error(f"Failed to send twitch message to Discord: {e}")
+            return
 
-            if s_id in twitch_active_tasks:
-                twitch_active_tasks[s_id].cancel()
-            twitch_active_tasks[s_id] = asyncio.create_task(
-                self.delayed_check(s_id, s_login)
-            )
-            await sync_state_to_dynamodb()
+        twitch_active_messages[s_id] = msg
+        if stream_id:
+            twitch_active_stream_ids[s_id] = stream_id
 
-    async def delayed_check(self, s_id: str, s_login: str) -> None:
+        existing = twitch_active_tasks.get(s_id)
+        if existing is not None and existing is not asyncio.current_task():
+            existing.cancel()
+        twitch_active_tasks[s_id] = asyncio.create_task(
+            self.delayed_check(s_id, s_login)
+        )
+        await sync_state_to_dynamodb()
+
+    async def delayed_check(self, s_id: str, s_login: str, delay: int = 3600) -> None:
         try:
-            await asyncio.sleep(3600)
+            if delay:
+                await asyncio.sleep(delay)
             if s_id not in twitch_active_messages:
                 return
 
-            streams = [s async for s in self.fetch_streams(user_ids=[s_id])]
+            streams = [
+                s
+                async for s in self.fetch_streams(user_ids=[s_id])
+                if _helix_stream_is_live(s)
+            ]
             if not streams:
                 await self.force_stream_offline(s_id, s_login)
                 await sync_state_to_dynamodb()
@@ -1013,10 +1144,10 @@ class HybridBot(twitchio.Client):
                 # Update the stream ID from the API fetch just in case it wasn't caught
                 current_stream_id = getattr(streams[0], "id", None)
                 if current_stream_id:
-                    twitch_active_stream_ids[s_id] = current_stream_id
+                    twitch_active_stream_ids[s_id] = str(current_stream_id)
 
                 msg = twitch_active_messages.get(s_id)
-                if msg and not isinstance(msg, int):  # <--- Add the isinstance check
+                if msg and not isinstance(msg, int):
                     await msg.edit(embed=self.build_twitch_embed(s_login, streams[0]))
 
                 twitch_active_tasks[s_id] = asyncio.create_task(
@@ -1028,10 +1159,12 @@ class HybridBot(twitchio.Client):
             pass
         except Exception as e:
             logger.error(f"Error in delayed check for {s_login}: {e}")
-            # Try again in an hour if there was a temporary network error
-            twitch_active_tasks[s_id] = asyncio.create_task(
-                self.delayed_check(s_id, s_login)
-            )
+            # Try again in an hour if there was a temporary network error.
+            # Skip this when the stream was just marked offline.
+            if s_id in twitch_active_messages:
+                twitch_active_tasks[s_id] = asyncio.create_task(
+                    self.delayed_check(s_id, s_login)
+                )
 
     def build_twitch_embed(self, login, data):
         if data:
@@ -1107,7 +1240,13 @@ class HybridBot(twitchio.Client):
         removed_yt = set(YOUTUBE_STREAMERS.keys()) - set(new_yt.keys())
 
         if not any([added_tw, removed_tw, added_yt, removed_yt]):
-            return  # No changes
+            # A display-name edit does not add or remove an id, but new alerts
+            # should still use the name currently stored in DynamoDB.
+            TWITCH_STREAMERS.clear()
+            TWITCH_STREAMERS.update(new_tw)
+            YOUTUBE_STREAMERS.clear()
+            YOUTUBE_STREAMERS.update(new_yt)
+            return
 
         TWITCH_STREAMERS.clear()
         TWITCH_STREAMERS.update(new_tw)
@@ -1150,28 +1289,19 @@ class HybridBot(twitchio.Client):
             logger.info(
                 f"🔄 YouTube streamers changed. Added: {added_yt}, Removed: {removed_yt}"
             )
-            hub_url = "https://pubsubhubbub.appspot.com/subscribe"
-
             for cid in added_yt:
-                data = {
-                    "hub.mode": "subscribe",
-                    "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
-                    "hub.callback": f"{PUBLIC_URL}/youtube",
-                    "hub.lease_seconds": 432000,
-                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
-                }
-                asyncio.create_task(self.session.post(hub_url, data=data))
-                logger.info(f"   ➜ Sent Sub request for YouTube: {new_yt[cid]}")
+                ok, err = await self._youtube_hub("subscribe", cid)
+                if ok:
+                    logger.info(f"   ➜ Sent Sub request for YouTube: {new_yt[cid]}")
+                else:
+                    logger.error(f"   ❌ Failed YouTube sub for {new_yt[cid]}: {err}")
 
             for cid in removed_yt:
-                data = {
-                    "hub.mode": "unsubscribe",
-                    "hub.topic": f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}",
-                    "hub.callback": f"{PUBLIC_URL}/youtube",
-                    "hub.secret": YOUTUBE_WEBHOOK_SECRET,
-                }
-                asyncio.create_task(self.session.post(hub_url, data=data))
-                logger.info(f"   ➜ Sent Unsub request for YouTube: {cid}")
+                ok, err = await self._youtube_hub("unsubscribe", cid)
+                if ok:
+                    logger.info(f"   ➜ Sent Unsub request for YouTube: {cid}")
+                else:
+                    logger.error(f"   ❌ Failed YouTube unsub for {cid}: {err}")
 
 
 @tasks.loop(minutes=90)
@@ -1185,20 +1315,45 @@ async def poll_streamers_task():
         await twitch_bot.reconcile_streamers(initial=False)
 
 
+def configure_file_logging():
+    # systemd's LogsDirectory=discord-twitch creates this folder and gives us write access
+    try:
+        file_handler = logging.FileHandler(
+            "/var/log/discord-twitch/discord-twitch.log", encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning(f"File logging unavailable ({e}). Continuing with stdout only.")
+        return
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+def _exit(code):
+    for handler in logger.handlers:
+        handler.flush()
+    sys.stdout.flush()
+    os._exit(code)
+
+
 def main() -> None:
     global twitch_bot
+    code = 0
     try:
+        configure_file_logging()
         load_config()
         twitch_bot = HybridBot()
         discord_bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
-        pass
+        code = 0
     except Exception as e:
         logger.critical(f"🔥 FATAL ERROR: {e}")
         traceback.print_exc()
-        sys.exit(1)
-    logger.info("Exiting sucessfully ( End of main )")
-    os._exit(0)
+        code = 1
+    else:
+        code = 0
+    if code == 0:
+        logger.info("Exiting sucessfully ( End of main )")
+    _exit(code)
 
 
 if __name__ == "__main__":
