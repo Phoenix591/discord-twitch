@@ -1,0 +1,98 @@
+#!/bin/sh
+# Publish a release tarball when a v* tag is created or moved.
+#
+# git archive of the tagged commit, with the tag written into pyproject.toml
+# as a static version. The archive has no .git directory, so setuptools_scm
+# is removed. The result is uploaded to
+# s3://phoenix591/discord-twitch/discord-twitch.tar.xz
+#
+# Git runs this as the reference-transaction hook. To publish an existing tag:
+#   hooks/reference-transaction --tag v16
+
+set -eu
+
+S3_URI="s3://phoenix591/discord-twitch/discord-twitch.tar.xz"
+
+publish() {
+  tag=$1
+  treeish=$2
+  case $tag in
+    v[0-9]*) ;;
+    *)
+      echo "reference-transaction: skipping $tag (not a v* release)" >&2
+      return 0
+      ;;
+  esac
+  version=${tag#v}
+  case $version in
+    *[!0-9.]*)
+      echo "reference-transaction: $tag is not a numeric version" >&2
+      return 1
+      ;;
+  esac
+
+  root=$(git rev-parse --show-toplevel)
+  tmp=$(mktemp -d)
+  # Clean up in this subshell only.
+  (
+    trap 'rm -rf "$tmp"' EXIT
+    git archive --format=tar --prefix=discord-twitch-source/ "$treeish" > "$tmp/src.tar"
+    tar -x -C "$tmp" -f "$tmp/src.tar"
+    python3 - "$version" "$tmp/discord-twitch-source/pyproject.toml" << 'PY'
+import pathlib
+import re
+import sys
+
+version, path = sys.argv[1], pathlib.Path(sys.argv[2])
+text = path.read_text()
+text, n = re.subn(
+    r'(?m)^dynamic = \["version"\]\n',
+    f'version = "{version}"\n',
+    text,
+    count=1,
+)
+if n != 1:
+    sys.exit("pyproject.toml has no dynamic version field")
+text, n = re.subn(r',\s*"setuptools_scm[^"]*"', "", text, count=1)
+if n != 1:
+    sys.exit("pyproject.toml build requires has no setuptools_scm")
+text, n = re.subn(r"\n\[tool\.setuptools_scm\][^\[]*", "\n", text, count=1)
+if n != 1:
+    sys.exit("pyproject.toml has no [tool.setuptools_scm] section")
+if not text.endswith("\n"):
+    text += "\n"
+path.write_text(text)
+PY
+    out=$root/discord-twitch.tar.xz
+    tar -C "$tmp" -cJf "$out" discord-twitch-source
+    echo "Uploading $out ($tag, version $version)"
+    aws s3 cp "$out" "$S3_URI"
+  )
+}
+
+if [ "${1:-}" = "--tag" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "usage: $0 --tag v16" >&2
+    exit 1
+  fi
+  publish "$2" "$2"
+  exit 0
+fi
+
+# reference-transaction <prepared|committed|aborted>
+# Abort the tag if publishing fails. The exit status is only honored for prepared.
+[ "${1:-}" = "prepared" ] || exit 0
+
+while read -r old new ref; do
+  case $ref in
+    refs/tags/*) ;;
+    *) continue ;;
+  esac
+  # Deletes use an all-zero object id.
+  case $new in
+    *[!0]*) ;;
+    *) continue ;;
+  esac
+  tag=${ref#refs/tags/}
+  publish "$tag" "$new"
+done
