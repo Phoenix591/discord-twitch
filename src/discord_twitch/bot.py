@@ -6,21 +6,17 @@ import math
 import os
 import sys
 import datetime
-import json
 import signal
-import subprocess
 import socket
 import traceback
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse, parse_qs
-from typing import Any
+from urllib.parse import urlparse
 from aiohttp import web, ClientSession, TCPConnector
 from discord.ext import commands, tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
 from twitchio.web import AiohttpAdapter
 from twitchio.eventsub import StreamOnlineSubscription, StreamOfflineSubscription
-import uuid
 import time
 import hmac
 import hashlib
@@ -29,12 +25,9 @@ import secrets
 from discord_twitch.config import dynamodb_settings, load_parser
 from discord_twitch.dynamo import scan_all
 
-INSTANCE_ID = str(uuid.uuid4())
-
-# Import boto3 for S3 access
+# Import boto3 for DynamoDB access
 try:
     import boto3
-    from botocore.exceptions import ClientError
 except ImportError:
     print("❌ Critical: 'boto3' is missing. Please run: pip install boto3")
     sys.exit(1)
@@ -149,6 +142,8 @@ TWITCH_CLIENT_ID = ""
 TWITCH_CLIENT_SECRET = ""
 YOUTUBE_API_KEY = ""
 YOUTUBE_BACKFILL_CHECK = 2
+# videos.list calls started together by one backfill.
+_YOUTUBE_BACKFILL_CONCURRENCY = 2
 SERVER_DOMAIN = ""
 PUBLIC_URL = ""
 LOCAL_PORT = 8080
@@ -253,6 +248,11 @@ def load_config():
         yt_secret = config["youtube"].get("webhook_secret", "").strip()
     if "twitch" in config:
         tw_secret = config["twitch"].get("eventsub_secret", "").strip()
+    if tw_secret and not 10 <= len(tw_secret) <= 100:
+        raise ValueError(
+            "twitch eventsub_secret must be between 10 and 100 characters "
+            f"(got {len(tw_secret)})"
+        )
     YOUTUBE_WEBHOOK_SECRET = yt_secret or secrets.token_hex(32)
     TWITCH_EVENTSUB_SECRET = tw_secret or secrets.token_hex(32)
     if not tw_secret:
@@ -480,14 +480,40 @@ async def sync_state_to_dynamodb():
             logger.error(f"❌ DynamoDB Sync failed: {e}")
 
 
+class EventSubAdapter(AiohttpAdapter):
+    """AiohttpAdapter that drops an EventSub id when the signature check fails.
+
+    twitchio records the message id before verifying the HMAC. Twitch retries
+    that same id after a non-2xx response, so a bad signature would make the
+    genuine retry look like a duplicate.
+    """
+
+    async def eventsub_callback(self, request: web.Request) -> web.Response:
+        message_id = request.headers.get("Twitch-Eventsub-Message-Id")
+        response = await super().eventsub_callback(request)
+        if response.status != 400 or not message_id:
+            return response
+        if "Failed to verify" not in (response.text or ""):
+            return response
+        try:
+            self._responded.remove(message_id)
+        except ValueError:
+            pass
+        return response
+
+
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
-        self.web_adapter = AiohttpAdapter(
+        # Listen on the path Twitch is told to call. An empty path keeps
+        # twitchio's /callback default.
+        public_path = urlparse(PUBLIC_URL).path.rstrip("/") or None
+        self.web_adapter = EventSubAdapter(
             host="0.0.0.0",
             port=LOCAL_PORT,
             domain=SERVER_DOMAIN,
             eventsub_secret=TWITCH_EVENTSUB_SECRET,
+            eventsub_path=public_path,
         )
         self.session = None
         self._twitch_sub_failed: set[str] = set()
@@ -787,8 +813,17 @@ class HybridBot(twitchio.Client):
                     logger.warning(f"   ❌ RSS Fallback exc for {channel_id}: {e}")
 
         if tasks:
-            await asyncio.gather(*tasks)
+            await self._gather_youtube_backfill(tasks)
             await sync_state_to_dynamodb()
+
+    async def _gather_youtube_backfill(self, tasks) -> None:
+        limit = asyncio.Semaphore(_YOUTUBE_BACKFILL_CONCURRENCY)
+
+        async def limited(check):
+            async with limit:
+                await check
+
+        await asyncio.gather(*(limited(task) for task in tasks))
 
     async def initial_youtube_check(self, video_id, save=True):
         try:
@@ -1223,12 +1258,34 @@ class HybridBot(twitchio.Client):
         if recovered:
             await self.announce_current_twitch_streams(recovered)
 
+    async def _drop_untracked_eventsubs(self) -> None:
+        """Delete this callback's subscriptions for broadcasters we no longer track.
+
+        Subscriptions that point somewhere else stay. They may belong to another
+        app on the same Twitch client id.
+        """
+        if not PUBLIC_URL:
+            return
+        wanted = PUBLIC_URL.rstrip("/")
+        events = await self.fetch_eventsub_subscriptions()
+        async for sub in events.subscriptions:
+            callback = getattr(getattr(sub, "transport", None), "callback", None)
+            if not callback or callback.rstrip("/") != wanted:
+                continue
+            condition = getattr(sub, "condition", None) or {}
+            broadcaster = str(condition.get("broadcaster_user_id", ""))
+            if broadcaster in TWITCH_STREAMERS:
+                continue
+            await sub.delete()
+            logger.info(
+                f"   Removed EventSub {sub.id} for untracked broadcaster {broadcaster or '?'}"
+            )
+
     async def setup_twitch_subs(self):
         try:
-            # This clears every EventSub subscription on the client id, not just ours.
-            await self.delete_all_eventsub_subscriptions()
+            await self._drop_untracked_eventsubs()
         except Exception as e:
-            logger.error(f"Failed to delete existing EventSub subscriptions: {e}")
+            logger.error(f"Failed to drop untracked EventSub subscriptions: {e}")
         logger.info(f"📋 Subscribing {len(TWITCH_STREAMERS)} Twitch channels...")
         for s_id, s_name in list(TWITCH_STREAMERS.items()):
             await self._subscribe_twitch(s_id, s_name)
@@ -1538,14 +1595,14 @@ class HybridBot(twitchio.Client):
                 f"🔄 Twitch streamers changed. Added: {added_tw}, Removed: {removed_tw}"
             )
             if removed_tw:
-                # Wiping and resubscribing is the cleanest way to clear old Twitch EventSubs
-                # since we don't cache the active Subscription IDs in memory.
+                # Drop subscriptions for the removed broadcasters, then resubscribe
+                # to whoever is still tracked. Other apps on this client id are kept.
                 logger.info(
-                    "   Wiping Twitch EventSubs and resubscribing due to removals..."
+                    "   Dropping removed Twitch EventSubs and resubscribing..."
                 )
                 await self.setup_twitch_subs()
-                # Events that fired while every subscription was deleted are gone.
-                # The live sweep posts anything that is already online.
+                # Subscriptions for the channels we still track are left in place.
+                # Sweep them in case one went live while subscribe calls were running.
                 await self.announce_current_twitch_streams()
             else:
                 for s_id in added_tw:
@@ -1565,6 +1622,11 @@ class HybridBot(twitchio.Client):
             for cid in removed_yt:
                 if not await self._ensure_youtube_sub(cid, cid, "unsubscribe"):
                     self._youtube_wake.set()
+
+            # Startup is the only other backfill. A channel added later would
+            # otherwise wait for the next WebSub post.
+            if added_yt:
+                await self.run_youtube_backfill()
 
 
 @tasks.loop(minutes=90)
@@ -1628,7 +1690,7 @@ def main() -> None:
     else:
         code = 0
     if code == 0:
-        logger.info("Exiting sucessfully ( End of main )")
+        logger.info("Exiting successfully ( End of main )")
     _exit(code)
 
 
