@@ -40,11 +40,18 @@ def _clean_bot_state():
     reset_state()
 
 
+class _Embed:
+    def __init__(self):
+        self.title = "Live"
+        self.url = "https://example.invalid/live"
+        self.image = None
+
+
 class _Msg:
     def __init__(self):
         self.id = 42
         self.edits = 0
-        self.embeds = []
+        self.embeds = [_Embed()]
 
     async def edit(self, **kwargs):
         self.edits += 1
@@ -321,16 +328,22 @@ def test_failed_twitch_subs_are_retried_on_the_next_poll(monkeypatch):
     async def run():
         client = bot.HybridBot()
         calls = []
+        swept = []
 
         async def subscribe(*args, **kwargs):
             calls.append(kwargs.get("payload"))
             return None
 
+        async def sweep(user_ids=None):
+            swept.append(list(user_ids) if user_ids is not None else None)
+
         client.subscribe_webhook = subscribe
+        client.announce_current_twitch_streams = sweep
         bot.TWITCH_STREAMERS["55"] = "Ada"
         client._twitch_sub_failed.add("55")
         await client.reconcile_streamers(initial=False)
         assert len(calls) == 2
+        assert swept == [["55"]]
         assert "55" not in client._twitch_sub_failed
 
     asyncio.run(run())

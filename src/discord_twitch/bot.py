@@ -1212,11 +1212,16 @@ class HybridBot(twitchio.Client):
         return False
 
     async def _retry_failed_twitch_subs(self) -> None:
+        recovered = []
         for s_id in list(self._twitch_sub_failed):
             if s_id not in TWITCH_STREAMERS:
                 self._twitch_sub_failed.discard(s_id)
                 continue
-            await self._subscribe_twitch(s_id, TWITCH_STREAMERS[s_id])
+            if await self._subscribe_twitch(s_id, TWITCH_STREAMERS[s_id]):
+                # stream.online already fired while we were unsubscribed.
+                recovered.append(s_id)
+        if recovered:
+            await self.announce_current_twitch_streams(recovered)
 
     async def setup_twitch_subs(self):
         try:
