@@ -12,7 +12,7 @@ import traceback
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from aiohttp import web, ClientSession, TCPConnector
-from discord.ext import commands, tasks
+from discord.ext import tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
 from twitchio.web import AiohttpAdapter
@@ -21,6 +21,7 @@ import time
 import hmac
 import hashlib
 import secrets
+import uuid
 
 from discord_twitch.config import dynamodb_settings, load_parser
 from discord_twitch.dynamo import scan_all
@@ -28,6 +29,7 @@ from discord_twitch.dynamo import scan_all
 # Import boto3 for DynamoDB access
 try:
     import boto3
+    from botocore.exceptions import ClientError
 except ImportError:
     print("❌ Critical: 'boto3' is missing. Please run: pip install boto3")
     sys.exit(1)
@@ -130,7 +132,20 @@ scheduler = AsyncIOScheduler(
 )
 YOUTUBE_WEBHOOK_SECRET = ""
 TWITCH_EVENTSUB_SECRET = ""
+# True when secret.cfg omitted the value and this process minted one.
+# A minted EventSub secret cannot verify subscriptions signed with the old one.
+TWITCH_EVENTSUB_SECRET_GENERATED = False
+YOUTUBE_WEBHOOK_SECRET_GENERATED = False
 _sync_lock = asyncio.Lock()
+
+# One row in the existing state table. A spot instance can be killed with no
+# time to unlock, so ownership is the expires_at timestamp. close() deletes
+# the row when it gets the chance; a dead process just waits out the TTL.
+INSTANCE_ID = str(uuid.uuid4())
+LEASE_VIDEO_ID = "lease"
+LEASE_TTL_SECONDS = 60
+LEASE_RENEW_SECONDS = 15
+_lease_held = False
 
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
@@ -153,11 +168,11 @@ INTERNAL_API_SECRET = ""
 
 
 # Discord Bot Setup
-class DiscordTwitchBot(commands.Bot):
+class DiscordTwitchBot(discord.Client):
     def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(intents=discord.Intents.default())
         self._sigterm = False
+        self._lease_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         # systemd stop sends SIGTERM. The default action kills the process
@@ -170,6 +185,10 @@ class DiscordTwitchBot(commands.Bot):
                 "SIGTERM handler is unavailable; a service stop will not save state."
             )
         if twitch_bot:
+            # main() acquires before run(). This covers a start that skipped it.
+            if not _lease_held:
+                await wait_for_lease()
+            self._lease_task = asyncio.create_task(_renew_state_lease())
             self.loop.create_task(twitch_bot.start())
 
     def _on_sigterm(self) -> None:
@@ -182,10 +201,20 @@ class DiscordTwitchBot(commands.Bot):
     async def close(self):
         logger.info("🛑 Received shutdown signal. Saving state...")
         _stop_background_tasks()
+        lease_task = self._lease_task
+        if lease_task is not None and not lease_task.done():
+            lease_task.cancel()
+            try:
+                await lease_task
+            except asyncio.CancelledError:
+                pass
         try:
             await sync_state_to_dynamodb()
         except Exception as e:
             logger.error(f"Error saving state on shutdown: {e}")
+        # Optional. A killed process leaves the row and the next one takes it
+        # after expires_at.
+        await asyncio.to_thread(_release_lease)
 
         if twitch_bot:
             logger.info("🛑 Shutting down Twitch Bot...")
@@ -220,6 +249,7 @@ def load_config():
     global SERVER_DOMAIN, PUBLIC_URL, LOCAL_PORT
     global TWITCH_STREAMERS, YOUTUBE_STREAMERS, INTERNAL_API_SECRET
     global YOUTUBE_WEBHOOK_SECRET, TWITCH_EVENTSUB_SECRET
+    global TWITCH_EVENTSUB_SECRET_GENERATED, YOUTUBE_WEBHOOK_SECRET_GENERATED
 
     config, secret_path = load_parser()
     logger.info(f"🔒 Loading secrets from: {secret_path}")
@@ -253,6 +283,8 @@ def load_config():
             "twitch eventsub_secret must be between 10 and 100 characters "
             f"(got {len(tw_secret)})"
         )
+    TWITCH_EVENTSUB_SECRET_GENERATED = not bool(tw_secret)
+    YOUTUBE_WEBHOOK_SECRET_GENERATED = not bool(yt_secret)
     YOUTUBE_WEBHOOK_SECRET = yt_secret or secrets.token_hex(32)
     TWITCH_EVENTSUB_SECRET = tw_secret or secrets.token_hex(32)
     if not tw_secret:
@@ -342,6 +374,8 @@ def _db_push(jobs_data, tw_data, yt_data, pending_ids=None):
 
         for item in db_items:
             video_id = item["video_id"]
+            if video_id == LEASE_VIDEO_ID:
+                continue
             if video_id not in active_db_keys and video_id not in pending_ids:
                 batch.delete_item(Key={"video_id": video_id})
 
@@ -380,6 +414,8 @@ async def sync_state_from_dynamodb(bot_instance):
 
         for item in items:
             db_key = item["video_id"]
+            if db_key == LEASE_VIDEO_ID:
+                continue
 
             if db_key.startswith("ytlive_"):
                 vid = db_key[7:]
@@ -425,7 +461,17 @@ async def sync_state_from_dynamodb(bot_instance):
 
 
 async def sync_state_to_dynamodb():
+    if not _lease_held:
+        logger.info(
+            "Skipping DynamoDB sync; this process does not hold the state lease."
+        )
+        return
     async with _sync_lock:
+        if not _lease_held:
+            logger.info(
+                "Skipping DynamoDB sync; this process does not hold the state lease."
+            )
+            return
         try:
             # Snapshot with no await. Placeholder 0 is an in-flight send, and a
             # bare message id has not been fetched yet. Keep the existing row
@@ -478,6 +524,102 @@ async def sync_state_to_dynamodb():
             logger.info("☁️  State synced to DynamoDB.")
         except Exception as e:
             logger.error(f"❌ DynamoDB Sync failed: {e}")
+
+
+def _acquire_or_renew_lease() -> bool:
+    """Take or extend the state lease. An expired row can be taken in place."""
+    global _lease_held
+    now = int(time.time())
+    table = _dynamodb_table(DYNAMODB_TABLE_NAME)
+    try:
+        table.update_item(
+            Key={"video_id": LEASE_VIDEO_ID},
+            UpdateExpression="SET owner = :o, expires_at = :e",
+            ConditionExpression=(
+                "attribute_not_exists(expires_at) OR expires_at < :now OR owner = :o"
+            ),
+            ExpressionAttributeValues={
+                ":o": INSTANCE_ID,
+                ":e": now + LEASE_TTL_SECONDS,
+                ":now": now,
+            },
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code == "ConditionalCheckFailedException":
+            _lease_held = False
+            return False
+        raise
+    _lease_held = True
+    return True
+
+
+async def wait_for_lease() -> None:
+    """Block until this process owns the state lease."""
+    while True:
+        try:
+            if await asyncio.to_thread(_acquire_or_renew_lease):
+                logger.info("State lease acquired.")
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("State lease acquire failed")
+        logger.info(
+            "State lease held by another instance; waiting for it to expire."
+        )
+        await asyncio.sleep(LEASE_RENEW_SECONDS)
+
+
+async def _renew_state_lease() -> None:
+    """Keep the lease alive. A lost lease is retried after the other owner expires."""
+    while not discord_bot.is_closed():
+        try:
+            held = await asyncio.to_thread(_acquire_or_renew_lease)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("State lease renew failed")
+        else:
+            if not held:
+                logger.warning(
+                    "State lease is held by another instance; "
+                    "this process will not write state until it expires."
+                )
+        try:
+            await asyncio.sleep(LEASE_RENEW_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+def _release_lease() -> None:
+    """Delete our lease row. A missing lease, or one we do not hold, is a no-op."""
+    global _lease_held
+    if not _lease_held:
+        return
+    try:
+        table = _dynamodb_table(DYNAMODB_TABLE_NAME)
+        table.delete_item(
+            Key={"video_id": LEASE_VIDEO_ID},
+            ConditionExpression="owner = :o",
+            ExpressionAttributeValues={":o": INSTANCE_ID},
+        )
+    except Exception:
+        logger.exception(
+            "Failed to release state lease; it will expire on its own."
+        )
+    finally:
+        _lease_held = False
+
+
+def _drop_unused_oauth_routes(router) -> None:
+    """Remove the OAuth routes twitchio mounts and this bot does not serve."""
+    for resource in list(router.resources()):
+        path = resource.get_info().get("path")
+        if path not in {"/oauth", "/oauth/callback"}:
+            continue
+        router.unindex_resource(resource)
+        router._resources.remove(resource)
 
 
 class EventSubAdapter(AiohttpAdapter):
@@ -535,6 +677,7 @@ class HybridBot(twitchio.Client):
                 "/internal/takeover", self.internal_takeover_handler
             )
             logger.info(f"Registered takeover handler")
+            _drop_unused_oauth_routes(self.web_adapter.router)
 
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT} (IPv4)")
@@ -1115,17 +1258,9 @@ class HybridBot(twitchio.Client):
             )
             url = f"https://www.youtube.com/watch?v={vid_id}"
 
-            stats = data.get("statistics", {})
-            is_members_only = "viewCount" not in stats
-
-            if is_members_only:
-                title_prefix = "( MEMBERS ONLY )"
-                desc = f"🔒 **{channel_name}** is live for **MEMBERS ONLY**!"
-                color = 0xFFD700  # Gold
-            else:
-                title_prefix = "🔴"
-                desc = f"**{channel_name}** is LIVE on YouTube!"
-                color = 0xFF0000  # Red
+            title_prefix = "🔴"
+            desc = f"**{channel_name}** is LIVE on YouTube!"
+            color = 0xFF0000
 
             embed = discord.Embed(
                 title=f"{title_prefix} {data['snippet']['title']}",
@@ -1258,11 +1393,14 @@ class HybridBot(twitchio.Client):
         if recovered:
             await self.announce_current_twitch_streams(recovered)
 
-    async def _drop_untracked_eventsubs(self) -> None:
-        """Delete this callback's subscriptions for broadcasters we no longer track.
+    async def _drop_our_eventsubs(self, *, only_untracked: bool) -> None:
+        """Delete EventSub subscriptions that call this process's public URL.
 
-        Subscriptions that point somewhere else stay. They may belong to another
-        app on the same Twitch client id.
+        only_untracked leaves subscriptions for broadcasters we still follow.
+        A generated EventSub secret has to replace every subscription on this
+        callback, because the previous HMAC no longer matches. Subscriptions
+        that point somewhere else stay. They may belong to another app on the
+        same Twitch client id.
         """
         if not PUBLIC_URL:
             return
@@ -1274,18 +1412,20 @@ class HybridBot(twitchio.Client):
                 continue
             condition = getattr(sub, "condition", None) or {}
             broadcaster = str(condition.get("broadcaster_user_id", ""))
-            if broadcaster in TWITCH_STREAMERS:
+            if only_untracked and broadcaster in TWITCH_STREAMERS:
                 continue
             await sub.delete()
             logger.info(
-                f"   Removed EventSub {sub.id} for untracked broadcaster {broadcaster or '?'}"
+                f"   Removed EventSub {sub.id} for broadcaster {broadcaster or '?'}"
             )
 
     async def setup_twitch_subs(self):
         try:
-            await self._drop_untracked_eventsubs()
+            await self._drop_our_eventsubs(
+                only_untracked=not TWITCH_EVENTSUB_SECRET_GENERATED
+            )
         except Exception as e:
-            logger.error(f"Failed to drop untracked EventSub subscriptions: {e}")
+            logger.error(f"Failed to drop EventSub subscriptions: {e}")
         logger.info(f"📋 Subscribing {len(TWITCH_STREAMERS)} Twitch channels...")
         for s_id, s_name in list(TWITCH_STREAMERS.items()):
             await self._subscribe_twitch(s_id, s_name)
@@ -1651,6 +1791,9 @@ def _stop_background_tasks() -> None:
     maint = getattr(twitch_bot, "_youtube_maint_task", None) if twitch_bot else None
     if maint is not None and not maint.done():
         maint.cancel()
+    lease = getattr(discord_bot, "_lease_task", None)
+    if lease is not None and not lease.done():
+        lease.cancel()
 
 
 def configure_file_logging():
@@ -1680,6 +1823,8 @@ def main() -> None:
         configure_file_logging()
         load_config()
         twitch_bot = HybridBot()
+        # Own the state lease before the webhook server binds.
+        asyncio.run(wait_for_lease())
         discord_bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
         code = 0
