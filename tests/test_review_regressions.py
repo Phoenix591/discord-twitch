@@ -40,12 +40,29 @@ _CONFIG_GLOBALS = (
 )
 
 
+def _reset_trackers():
+    for task in list(bot.twitch_active_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    bot.twitch_active_messages.clear()
+    bot.twitch_active_tasks.clear()
+    bot.twitch_active_stream_ids.clear()
+    bot.youtube_active_messages.clear()
+    bot._twitch_locks.clear()
+    bot.TWITCH_STREAMERS.clear()
+    bot.YOUTUBE_STREAMERS.clear()
+    for job in bot.scheduler.get_jobs():
+        job.remove()
+
+
 @pytest.fixture(autouse=True)
 def _restore_config_globals():
     saved = {name: getattr(bot, name) for name in _CONFIG_GLOBALS}
+    _reset_trackers()
     yield
     for name, value in saved.items():
         setattr(bot, name, value)
+    _reset_trackers()
 
 
 class _Embed:
@@ -376,40 +393,51 @@ def test_sync_keeps_rows_this_process_does_not_own(monkeypatch):
     assert "tw_other" not in deleted
 
 
-@pytest.mark.xfail(
-    reason=(
-        "setup_twitch_subs calls delete_all_eventsub_subscriptions, which "
-        "wipes every EventSub subscription on the shared Twitch client id."
-    ),
-    strict=False,
-)
-def test_setup_twitch_subs_does_not_wipe_the_client(monkeypatch):
+def test_setup_twitch_subs_does_not_wipe_the_client():
     wiped = []
+    deleted = []
+    subscribed = []
+    callback = "https://twitch.example.com/callback"
+
+    class Sub:
+        def __init__(self, sub_id, url, broadcaster):
+            self.id = sub_id
+            self.transport = SimpleNamespace(callback=url)
+            self.condition = {"broadcaster_user_id": broadcaster}
+
+        async def delete(self):
+            deleted.append(self.id)
+
+    async def subscriptions():
+        yield Sub("stale", callback, "999")
+        yield Sub("kept", callback, "1")
+        yield Sub("foreign", "https://other.example/hook", "999")
+
+    async def fetch(**kwargs):
+        return SimpleNamespace(subscriptions=subscriptions())
 
     async def delete_all():
         wiped.append(True)
 
     async def subscribe(s_id, s_name):
+        subscribed.append(s_id)
         return True
 
     async def run():
+        bot.PUBLIC_URL = callback
         client = bot.HybridBot()
         client.delete_all_eventsub_subscriptions = delete_all
+        client.fetch_eventsub_subscriptions = fetch
         client._subscribe_twitch = subscribe
         bot.TWITCH_STREAMERS["1"] = "Ada"
         await client.setup_twitch_subs()
 
     asyncio.run(run())
     assert wiped == []
+    assert deleted == ["stale"]
+    assert subscribed == ["1"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "The EventSub listen path is hardcoded to /callback. PUBLIC_URL's "
-        "path is only applied to the YouTube route."
-    ),
-    strict=False,
-)
 def test_eventsub_path_follows_public_url():
     bot.PUBLIC_URL = "https://twitch.example.com/hooks/twitch"
     bot.SERVER_DOMAIN = "twitch.example.com"
@@ -418,13 +446,6 @@ def test_eventsub_path_follows_public_url():
     assert client.web_adapter._eventsub_path == "/hooks/twitch"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Adding a YouTube channel only subscribes at the hub. Videos that "
-        "are already live or scheduled are backfilled only at process start."
-    ),
-    strict=False,
-)
 def test_added_youtube_channel_backfills_current_videos(monkeypatch):
     called = []
 
@@ -517,14 +538,6 @@ def _eventsub_request(loop, body, headers):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "twitchio records the EventSub message id before HMAC verification, "
-        "so a bad signature burns the id and the genuine retry is rejected "
-        "as already handled."
-    ),
-    strict=False,
-)
 def test_eventsub_retry_with_the_same_id_is_verified():
     secret = "s" * 16
     bot.TWITCH_EVENTSUB_SECRET = secret
@@ -583,20 +596,25 @@ def test_oauth_routes_are_not_mounted():
     assert ("GET", "/oauth/callback") not in mounted
 
 
-@pytest.mark.xfail(
-    reason=(
-        "manage_streamer --remove prints success even when DynamoDB has no "
-        "matching streamer."
-    ),
-    strict=False,
-)
 def test_remove_missing_streamer_is_not_success(tmp_path, monkeypatch, capsys):
     _secret_file(tmp_path / "secret.cfg")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
 
     class Table:
-        def delete_item(self, Key):
-            return {}
+        def delete_item(self, Key, **kwargs):
+            if "ConditionExpression" not in kwargs:
+                return {}
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "DeleteItem",
+            )
 
     class Resource:
         def Table(self, name):
@@ -611,7 +629,9 @@ def test_remove_missing_streamer_is_not_success(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as caught:
         manage_streamer.main()
     assert caught.value.code not in (0, None)
-    assert "Removed" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Removed" not in output
+    assert "missing-id" in output
 
 
 class _HttpResponse:
@@ -634,17 +654,11 @@ class _HttpGet:
         return False
 
 
-@pytest.mark.xfail(
-    reason=(
-        "run_youtube_backfill gathers one initial_youtube_check per channel "
-        "with no concurrency limit."
-    ),
-    strict=False,
-)
 def test_youtube_backfill_limits_concurrency(monkeypatch):
-    inflight = {"current": 0, "peak": 0}
+    inflight = {"current": 0, "peak": 0, "started": 0}
 
     async def initial(video_id, save=True):
+        inflight["started"] += 1
         inflight["current"] += 1
         inflight["peak"] = max(inflight["peak"], inflight["current"])
         await asyncio.sleep(0.05)
@@ -687,7 +701,8 @@ def test_youtube_backfill_limits_concurrency(monkeypatch):
         await client.run_youtube_backfill()
 
     asyncio.run(run())
-    assert inflight["peak"] <= 2
+    assert inflight["started"] == 4
+    assert inflight["peak"] == 2
 
 
 @pytest.mark.xfail(
@@ -720,16 +735,9 @@ def test_generated_webhook_secrets_stay_stable(tmp_path, monkeypatch):
     assert 10 <= len(eventsub) <= 100
 
 
-@pytest.mark.xfail(
-    reason=(
-        "An EventSub secret longer than 100 characters is stored and then "
-        "crashes HybridBot inside twitchio instead of being rejected while "
-        "loading config."
-    ),
-    strict=False,
-)
 def test_overlong_eventsub_secret_is_rejected_at_config(tmp_path, monkeypatch):
     _secret_file(tmp_path / "secret.cfg", twitch_extra="eventsub_secret = " + ("a" * 128) + "\n")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
-    bot.load_config()
-    assert 10 <= len(bot.TWITCH_EVENTSUB_SECRET) <= 100
+    with pytest.raises(ValueError, match="eventsub_secret"):
+        bot.load_config()
+    assert bot.TWITCH_EVENTSUB_SECRET != "a" * 128
