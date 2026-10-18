@@ -5,12 +5,13 @@ requires-python = ">=3.12"
 authors = [{ name = "Phoenix591" }]
 dynamic = ["version"]
 dependencies = [
-    "discord.py>=2.0.0",
-    "twitchio>=3.0.0",
-    "aiohttp>=3.7.4",
+    "discord.py>=2.7.1",
+    "twitchio>=3.3.2",
+    # 4.x is still a pre-release, and discord.py / twitchio both require aiohttp<4.
+    "aiohttp>=3.14.5,<4",
     # 4.x removes AsyncIOScheduler and add_job. It is still a pre-release.
-    "apscheduler>=3.11.2,<4",
-    "boto3>=1.42.39"
+    "apscheduler>=3.11.3,<4",
+    "boto3>=1.43.114"
 ]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -19,7 +20,7 @@ discord-twitch = "discord_twitch.bot:main"
 manage_streamer = "discord_twitch.manage_streamer:main"
 
 [build-system]
-requires = ["setuptools>=77", "setuptools_scm>=8.0"]
+requires = ["setuptools>=84", "setuptools_scm>=10.3.4"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
