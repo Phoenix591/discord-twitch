@@ -36,7 +36,10 @@ def load_parser():
     if not path:
         raise FileNotFoundError("❌ Failed to parse secret file: secret.cfg")
 
-    parser = configparser.ConfigParser()
+    # interpolation=None: secrets often contain "%" (or look like "%(").
+    # The default interpolator raises InterpolationSyntaxError and the bot
+    # crash-loops instead of starting.
+    parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
     if not parser.read(path):
         raise FileNotFoundError(f"❌ Failed to parse secret file: {path}")
