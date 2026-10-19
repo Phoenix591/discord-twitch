@@ -29,6 +29,7 @@ def reset_state():
     bot._twitch_locks.clear()
     bot.TWITCH_STREAMERS.clear()
     bot.YOUTUBE_STREAMERS.clear()
+    bot._lease_held = True
     for job in bot.scheduler.get_jobs():
         job.remove()
 

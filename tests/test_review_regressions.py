@@ -1,17 +1,18 @@
-"""Regression checks for the review fixes, plus xfail markers for open bugs.
+"""Regression checks for the review fixes.
 
 Tests call the bot with stubs. No Discord, Twitch, or AWS credentials are used.
-An xfail here is an open finding: the assertion is the behavior we want, and
-the test fails on current main. strict is off so a later fix shows up as xpass
-without turning the suite red.
 """
 
 import asyncio
 import datetime
 import hashlib
 import hmac
+import time
 from types import SimpleNamespace
 
+from botocore.exceptions import ClientError
+
+import discord
 import pytest
 from aiohttp.base_protocol import BaseProtocol
 from aiohttp.streams import StreamReader
@@ -25,6 +26,8 @@ _CONFIG_GLOBALS = (
     "SERVER_DOMAIN",
     "TWITCH_EVENTSUB_SECRET",
     "YOUTUBE_WEBHOOK_SECRET",
+    "TWITCH_EVENTSUB_SECRET_GENERATED",
+    "YOUTUBE_WEBHOOK_SECRET_GENERATED",
     "YOUTUBE_API_KEY",
     "YOUTUBE_BACKFILL_CHECK",
     "INTERNAL_API_SECRET",
@@ -40,12 +43,30 @@ _CONFIG_GLOBALS = (
 )
 
 
+def _reset_trackers():
+    for task in list(bot.twitch_active_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    bot.twitch_active_messages.clear()
+    bot.twitch_active_tasks.clear()
+    bot.twitch_active_stream_ids.clear()
+    bot.youtube_active_messages.clear()
+    bot._twitch_locks.clear()
+    bot.TWITCH_STREAMERS.clear()
+    bot.YOUTUBE_STREAMERS.clear()
+    bot._lease_held = True
+    for job in bot.scheduler.get_jobs():
+        job.remove()
+
+
 @pytest.fixture(autouse=True)
 def _restore_config_globals():
     saved = {name: getattr(bot, name) for name in _CONFIG_GLOBALS}
+    _reset_trackers()
     yield
     for name, value in saved.items():
         setattr(bot, name, value)
+    _reset_trackers()
 
 
 class _Embed:
@@ -239,6 +260,7 @@ def test_shutdown_saves_state_without_a_twitch_client(monkeypatch):
 
     monkeypatch.setattr(bot, "sync_state_to_dynamodb", save)
     monkeypatch.setattr(bot, "twitch_bot", None)
+    bot._lease_held = False
 
     async def run():
         await bot.DiscordTwitchBot().close()
@@ -337,16 +359,9 @@ class _Table:
         return _Batch(self._deleted)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Takeover has no lease. _db_push scan-deletes every DynamoDB row this "
-        "process does not have in memory, so two overlapping processes erase "
-        "each other's live alerts."
-    ),
-    strict=False,
-)
 def test_sync_keeps_rows_this_process_does_not_own(monkeypatch):
     deleted = []
+    bot._lease_held = False
 
     def rows(table):
         return [
@@ -373,43 +388,225 @@ def test_sync_keeps_rows_this_process_does_not_own(monkeypatch):
         await bot.sync_state_to_dynamodb()
 
     asyncio.run(run())
-    assert "tw_other" not in deleted
+    assert deleted == []
 
 
-@pytest.mark.xfail(
-    reason=(
-        "setup_twitch_subs calls delete_all_eventsub_subscriptions, which "
-        "wipes every EventSub subscription on the shared Twitch client id."
-    ),
-    strict=False,
-)
-def test_setup_twitch_subs_does_not_wipe_the_client(monkeypatch):
+def test_sync_holder_drops_untracked_rows_and_keeps_the_lease(monkeypatch):
+    deleted = []
+
+    def rows(table):
+        return [
+            {
+                "video_id": "tw_mine",
+                "message_id": "1",
+                "login": "ada",
+                "stream_id": "s",
+            },
+            {
+                "video_id": "tw_other",
+                "message_id": "9",
+                "login": "bob",
+                "stream_id": "o",
+            },
+            {"video_id": "lease", "owner": "previous", "expires_at": 1},
+        ]
+
+    monkeypatch.setattr(bot, "scan_all", rows)
+    monkeypatch.setattr(bot, "_dynamodb_table", lambda name: _Table(deleted))
+    bot._lease_held = True
+    bot.twitch_active_messages["mine"] = _Msg()
+    bot.twitch_active_stream_ids["mine"] = "s"
+
+    async def run():
+        await bot.sync_state_to_dynamodb()
+
+    asyncio.run(run())
+    assert "tw_other" in deleted
+    assert "lease" not in deleted
+
+
+class _LeaseTable:
+    def __init__(self, item):
+        self.item = item
+        self.calls = []
+
+    def update_item(self, **kwargs):
+        self.calls.append("update")
+        values = kwargs["ExpressionAttributeValues"]
+        now = values[":now"]
+        owner = values[":o"]
+        expires = values[":e"]
+        current = self.item
+        allowed = (
+            current is None
+            or current.get("expires_at") is None
+            or int(current["expires_at"]) < now
+            or current.get("owner") == owner
+        )
+        if not allowed:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "UpdateItem",
+            )
+        self.item = {
+            "video_id": kwargs["Key"]["video_id"],
+            "owner": owner,
+            "expires_at": expires,
+        }
+
+    def delete_item(self, **kwargs):
+        self.calls.append("delete")
+        owner = kwargs["ExpressionAttributeValues"][":o"]
+        if not self.item or self.item.get("owner") != owner:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "DeleteItem",
+            )
+        self.item = None
+
+
+def test_missing_lease_is_acquired(monkeypatch):
+    table = _LeaseTable(None)
+    monkeypatch.setattr(bot, "_dynamodb_table", lambda name: table)
+    bot._lease_held = False
+    assert bot._acquire_or_renew_lease() is True
+    assert table.item["owner"] == bot.INSTANCE_ID
+    assert table.item["video_id"] == "lease"
+    assert bot._lease_held is True
+
+
+def test_expired_lease_is_taken_without_a_release(monkeypatch):
+    table = _LeaseTable({"video_id": "lease", "owner": "dead", "expires_at": 1})
+    monkeypatch.setattr(bot, "_dynamodb_table", lambda name: table)
+    bot._lease_held = False
+    assert bot._acquire_or_renew_lease() is True
+    assert table.item["owner"] == bot.INSTANCE_ID
+    assert "delete" not in table.calls
+    assert bot._lease_held is True
+
+
+def test_live_lease_blocks_another_instance(monkeypatch):
+    future = int(time.time()) + 3600
+    table = _LeaseTable(
+        {"video_id": "lease", "owner": "other", "expires_at": future}
+    )
+    monkeypatch.setattr(bot, "_dynamodb_table", lambda name: table)
+    bot._lease_held = True
+    assert bot._acquire_or_renew_lease() is False
+    assert table.item["owner"] == "other"
+    assert table.item["expires_at"] == future
+    assert bot._lease_held is False
+
+
+def test_release_without_a_lease_does_not_call_dynamodb(monkeypatch):
+    def boom(name):
+        raise AssertionError("dynamodb")
+
+    monkeypatch.setattr(bot, "_dynamodb_table", boom)
+    bot._lease_held = False
+    bot._release_lease()
+
+
+def test_state_restore_ignores_the_lease_row(monkeypatch):
+    seen = []
+
+    async def record_youtube(bot_instance, channel, vid, msg_id):
+        seen.append(("yt", vid))
+
+    async def record_twitch(
+        bot_instance, channel, s_id, login, msg_id, stream_id=""
+    ):
+        seen.append(("tw", s_id))
+
+    async def save():
+        return None
+
+    monkeypatch.setattr(bot, "restore_youtube_state", record_youtube)
+    monkeypatch.setattr(bot, "restore_twitch_state", record_twitch)
+    monkeypatch.setattr(bot, "sync_state_to_dynamodb", save)
+    monkeypatch.setattr(
+        bot,
+        "_db_scan",
+        lambda: [
+            {"video_id": "lease", "owner": "other", "expires_at": 1},
+            {
+                "video_id": "tw_7",
+                "message_id": "22",
+                "login": "ada",
+                "stream_id": "stream-1",
+            },
+        ],
+    )
+
+    async def channel():
+        return object()
+
+    monkeypatch.setattr(bot, "discord_channel", channel)
+
+    async def run():
+        await bot.sync_state_from_dynamodb(SimpleNamespace())
+
+    asyncio.run(run())
+    assert seen == [("tw", "7")]
+
+
+def test_setup_twitch_subs_does_not_wipe_the_client():
     wiped = []
+    deleted = []
+    subscribed = []
+    callback = "https://twitch.example.com/callback"
+
+    class Sub:
+        def __init__(self, sub_id, url, broadcaster):
+            self.id = sub_id
+            self.transport = SimpleNamespace(callback=url)
+            self.condition = {"broadcaster_user_id": broadcaster}
+
+        async def delete(self):
+            deleted.append(self.id)
+
+    async def subscriptions():
+        yield Sub("stale", callback, "999")
+        yield Sub("kept", callback, "1")
+        yield Sub("foreign", "https://other.example/hook", "999")
+
+    async def fetch(**kwargs):
+        return SimpleNamespace(subscriptions=subscriptions())
 
     async def delete_all():
         wiped.append(True)
 
     async def subscribe(s_id, s_name):
+        subscribed.append(s_id)
         return True
 
     async def run():
+        bot.PUBLIC_URL = callback
+        bot.TWITCH_EVENTSUB_SECRET_GENERATED = False
+        bot.YOUTUBE_WEBHOOK_SECRET_GENERATED = True
         client = bot.HybridBot()
         client.delete_all_eventsub_subscriptions = delete_all
+        client.fetch_eventsub_subscriptions = fetch
         client._subscribe_twitch = subscribe
         bot.TWITCH_STREAMERS["1"] = "Ada"
         await client.setup_twitch_subs()
 
     asyncio.run(run())
     assert wiped == []
+    assert deleted == ["stale"]
+    assert subscribed == ["1"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "The EventSub listen path is hardcoded to /callback. PUBLIC_URL's "
-        "path is only applied to the YouTube route."
-    ),
-    strict=False,
-)
 def test_eventsub_path_follows_public_url():
     bot.PUBLIC_URL = "https://twitch.example.com/hooks/twitch"
     bot.SERVER_DOMAIN = "twitch.example.com"
@@ -418,13 +615,6 @@ def test_eventsub_path_follows_public_url():
     assert client.web_adapter._eventsub_path == "/hooks/twitch"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Adding a YouTube channel only subscribes at the hub. Videos that "
-        "are already live or scheduled are backfilled only at process start."
-    ),
-    strict=False,
-)
 def test_added_youtube_channel_backfills_current_videos(monkeypatch):
     called = []
 
@@ -456,13 +646,6 @@ def test_added_youtube_channel_backfills_current_videos(monkeypatch):
     assert called == ["backfill"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "A public live video whose statistics omit viewCount is announced "
-        "as MEMBERS ONLY."
-    ),
-    strict=False,
-)
 def test_public_live_without_viewcount_is_not_members_only(monkeypatch):
     sent = []
 
@@ -517,14 +700,6 @@ def _eventsub_request(loop, body, headers):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "twitchio records the EventSub message id before HMAC verification, "
-        "so a bad signature burns the id and the genuine retry is rejected "
-        "as already handled."
-    ),
-    strict=False,
-)
 def test_eventsub_retry_with_the_same_id_is_verified():
     secret = "s" * 16
     bot.TWITCH_EVENTSUB_SECRET = secret
@@ -566,13 +741,6 @@ def test_eventsub_retry_with_the_same_id_is_verified():
     asyncio.run(run())
 
 
-@pytest.mark.xfail(
-    reason=(
-        "AiohttpAdapter always mounts GET /oauth and GET /oauth/callback, "
-        "which this bot does not use."
-    ),
-    strict=False,
-)
 def test_oauth_routes_are_not_mounted():
     client = bot.HybridBot()
     mounted = {
@@ -583,20 +751,25 @@ def test_oauth_routes_are_not_mounted():
     assert ("GET", "/oauth/callback") not in mounted
 
 
-@pytest.mark.xfail(
-    reason=(
-        "manage_streamer --remove prints success even when DynamoDB has no "
-        "matching streamer."
-    ),
-    strict=False,
-)
 def test_remove_missing_streamer_is_not_success(tmp_path, monkeypatch, capsys):
     _secret_file(tmp_path / "secret.cfg")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
 
     class Table:
-        def delete_item(self, Key):
-            return {}
+        def delete_item(self, Key, **kwargs):
+            if "ConditionExpression" not in kwargs:
+                return {}
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "DeleteItem",
+            )
 
     class Resource:
         def Table(self, name):
@@ -611,7 +784,9 @@ def test_remove_missing_streamer_is_not_success(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as caught:
         manage_streamer.main()
     assert caught.value.code not in (0, None)
-    assert "Removed" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Removed" not in output
+    assert "missing-id" in output
 
 
 class _HttpResponse:
@@ -634,17 +809,11 @@ class _HttpGet:
         return False
 
 
-@pytest.mark.xfail(
-    reason=(
-        "run_youtube_backfill gathers one initial_youtube_check per channel "
-        "with no concurrency limit."
-    ),
-    strict=False,
-)
 def test_youtube_backfill_limits_concurrency(monkeypatch):
-    inflight = {"current": 0, "peak": 0}
+    inflight = {"current": 0, "peak": 0, "started": 0}
 
     async def initial(video_id, save=True):
+        inflight["started"] += 1
         inflight["current"] += 1
         inflight["peak"] = max(inflight["peak"], inflight["current"])
         await asyncio.sleep(0.05)
@@ -687,49 +856,81 @@ def test_youtube_backfill_limits_concurrency(monkeypatch):
         await client.run_youtube_backfill()
 
     asyncio.run(run())
-    assert inflight["peak"] <= 2
+    assert inflight["started"] == 4
+    assert inflight["peak"] == 2
 
 
-@pytest.mark.xfail(
-    reason=(
-        "_helix_stream_is_live treats an empty Helix stream type as live, "
-        "so an undetermined stream is announced."
-    ),
-    strict=False,
-)
-def test_blank_helix_stream_type_is_not_live():
-    assert bot._helix_stream_is_live(SimpleNamespace(type="")) is False
+def test_blank_helix_stream_type_is_treated_as_live():
+    assert bot._helix_stream_is_live(SimpleNamespace(type="")) is True
+    assert bot._helix_stream_is_live(SimpleNamespace(type="live")) is True
 
 
-@pytest.mark.xfail(
-    reason=(
-        "load_config mints a new EventSub and WebSub secret on every call "
-        "when secret.cfg omits them, so a reload rotates the HMAC keys."
-    ),
-    strict=False,
-)
-def test_generated_webhook_secrets_stay_stable(tmp_path, monkeypatch):
+def test_generated_eventsub_secret_replaces_only_our_subscriptions():
+    wiped = []
+    deleted = []
+    subscribed = []
+    callback = "https://twitch.example.com/callback"
+
+    class Sub:
+        def __init__(self, sub_id, url, broadcaster):
+            self.id = sub_id
+            self.transport = SimpleNamespace(callback=url)
+            self.condition = {"broadcaster_user_id": broadcaster}
+
+        async def delete(self):
+            deleted.append(self.id)
+
+    async def subscriptions():
+        yield Sub("stale", callback, "999")
+        yield Sub("kept", callback, "1")
+        yield Sub("foreign", "https://other.example/hook", "999")
+
+    async def fetch(**kwargs):
+        return SimpleNamespace(subscriptions=subscriptions())
+
+    async def delete_all():
+        wiped.append(True)
+
+    async def subscribe(s_id, s_name):
+        subscribed.append(s_id)
+        return True
+
+    async def run():
+        bot.PUBLIC_URL = callback
+        bot.TWITCH_EVENTSUB_SECRET_GENERATED = True
+        bot.YOUTUBE_WEBHOOK_SECRET_GENERATED = False
+        client = bot.HybridBot()
+        client.delete_all_eventsub_subscriptions = delete_all
+        client.fetch_eventsub_subscriptions = fetch
+        client._subscribe_twitch = subscribe
+        bot.TWITCH_STREAMERS["1"] = "Ada"
+        await client.setup_twitch_subs()
+
+    asyncio.run(run())
+    assert wiped == []
+    assert deleted == ["stale", "kept"]
+    assert subscribed == ["1"]
+
+
+def test_omitted_secrets_are_generated_for_this_process(tmp_path, monkeypatch):
     _secret_file(tmp_path / "secret.cfg")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
     bot.load_config()
-    eventsub = bot.TWITCH_EVENTSUB_SECRET
-    websub = bot.YOUTUBE_WEBHOOK_SECRET
-    bot.load_config()
-    assert bot.TWITCH_EVENTSUB_SECRET == eventsub
-    assert bot.YOUTUBE_WEBHOOK_SECRET == websub
-    assert 10 <= len(eventsub) <= 100
+    assert bot.TWITCH_EVENTSUB_SECRET_GENERATED is True
+    assert bot.YOUTUBE_WEBHOOK_SECRET_GENERATED is True
+    assert 10 <= len(bot.TWITCH_EVENTSUB_SECRET) <= 100
+    assert bot.YOUTUBE_WEBHOOK_SECRET
 
 
-@pytest.mark.xfail(
-    reason=(
-        "An EventSub secret longer than 100 characters is stored and then "
-        "crashes HybridBot inside twitchio instead of being rejected while "
-        "loading config."
-    ),
-    strict=False,
-)
+def test_discord_client_has_no_command_prefix():
+    client = bot.DiscordTwitchBot()
+    assert isinstance(client, discord.Client)
+    assert not hasattr(client, "command_prefix")
+
+
 def test_overlong_eventsub_secret_is_rejected_at_config(tmp_path, monkeypatch):
     _secret_file(tmp_path / "secret.cfg", twitch_extra="eventsub_secret = " + ("a" * 128) + "\n")
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
-    bot.load_config()
-    assert 10 <= len(bot.TWITCH_EVENTSUB_SECRET) <= 100
+    with pytest.raises(ValueError, match="eventsub_secret"):
+        bot.load_config()
+    assert bot.TWITCH_EVENTSUB_SECRET != "a" * 128

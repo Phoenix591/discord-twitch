@@ -3,6 +3,8 @@ import boto3
 import argparse
 import sys
 
+from botocore.exceptions import ClientError
+
 from discord_twitch.config import dynamodb_settings, load_parser
 from discord_twitch.dynamo import scan_all
 
@@ -100,8 +102,18 @@ def main():
     # --- REMOVE LOGIC ---
     if args.remove:
         try:
-            table.delete_item(Key={"platform": args.platform, "channel_id": args.id})
+            table.delete_item(
+                Key={"platform": args.platform, "channel_id": args.id},
+                ConditionExpression="attribute_exists(channel_id)",
+            )
             print(f"🗑️  Removed {args.platform} streamer with ID {args.id}")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                print(f"❌ No {args.platform} streamer with ID {args.id} to remove")
+                sys.exit(1)
+            print(f"❌ Failed to remove item: {e}")
+            sys.exit(1)
         except Exception as e:
             print(f"❌ Failed to remove item: {e}")
             sys.exit(1)
