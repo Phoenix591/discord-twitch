@@ -37,6 +37,10 @@ def _fixed_offline_edit() -> bool:
     return "keep tracking until a later check can edit the message" in source
 
 
+def _fixed_restore_row() -> bool:
+    return hasattr(bot, "_queue_restored_item")
+
+
 _XFAIL_LEASE = pytest.mark.xfail(
     not _fixed_lease(),
     strict=True,
@@ -66,6 +70,14 @@ _XFAIL_STREAM = pytest.mark.xfail(
     strict=True,
     reason=(
         "A new Helix stream id is kept only in memory on main. "
+        "Remove this xfail once the fix PR merges."
+    ),
+)
+_XFAIL_RESTORE = pytest.mark.xfail(
+    not _fixed_restore_row(),
+    strict=True,
+    reason=(
+        "One unreadable state row aborts the rest of the restore on main. "
         "Remove this xfail once the fix PR merges."
     ),
 )
@@ -349,6 +361,46 @@ def _install_stream(stream_id):
         yield stream
 
     return fetch_streams
+
+
+@_XFAIL_RESTORE
+def test_one_unreadable_state_row_does_not_drop_the_next(monkeypatch):
+    seen = []
+
+    async def record_twitch(
+        bot_instance, channel, s_id, login, msg_id, stream_id=""
+    ):
+        seen.append(s_id)
+
+    async def save():
+        return None
+
+    monkeypatch.setattr(bot, "restore_twitch_state", record_twitch)
+    monkeypatch.setattr(bot, "sync_state_to_dynamodb", save)
+    monkeypatch.setattr(
+        bot,
+        "_db_scan",
+        lambda: [
+            {"video_id": "yt_bad", "scheduled_time": "not-a-timestamp"},
+            {
+                "video_id": "tw_7",
+                "message_id": "22",
+                "login": "ada",
+                "stream_id": "stream-1",
+            },
+        ],
+    )
+
+    async def channel():
+        return object()
+
+    monkeypatch.setattr(bot, "discord_channel", channel)
+
+    async def run():
+        await bot.sync_state_from_dynamodb(SimpleNamespace())
+
+    asyncio.run(run())
+    assert seen == ["7"]
 
 
 @_XFAIL_STREAM
