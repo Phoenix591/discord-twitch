@@ -418,6 +418,43 @@ async def discord_channel():
 
 
 # --- Main Async Sync Functions ---
+def _queue_restored_item(bot_instance, channel, item, now, restore_tasks) -> None:
+    """Parse one state row into a scheduler job or a message restore."""
+    db_key = item["video_id"]
+    if db_key == LEASE_VIDEO_ID:
+        return
+
+    if db_key.startswith("ytlive_"):
+        vid = db_key[7:]
+        msg_id = int(item.get("message_id", 0))
+        if msg_id:
+            restore_tasks.append(
+                restore_youtube_state(bot_instance, channel, vid, msg_id)
+            )
+    elif db_key.startswith("yt_"):
+        vid = db_key[3:]
+        s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
+        if s_time < now - datetime.timedelta(days=2) or s_time > now + datetime.timedelta(
+            days=45
+        ):
+            return
+        run_date = s_time - datetime.timedelta(minutes=3)
+        if run_date < now:
+            run_date = now + datetime.timedelta(seconds=5)
+        bot_instance.schedule_youtube_sniper(vid, s_time, run_date)
+    elif db_key.startswith("tw_"):
+        s_id = db_key[3:]
+        login = item.get("login", "")
+        msg_id = int(item.get("message_id", 0))
+        stream_id = item.get("stream_id", "")
+        if msg_id:
+            restore_tasks.append(
+                restore_twitch_state(
+                    bot_instance, channel, s_id, login, msg_id, stream_id
+                )
+            )
+
+
 async def sync_state_from_dynamodb(bot_instance):
     try:
         logger.info("☁️  Downloading state from DynamoDB...")
@@ -434,39 +471,14 @@ async def sync_state_from_dynamodb(bot_instance):
         restore_tasks = []
 
         for item in items:
-            db_key = item["video_id"]
-            if db_key == LEASE_VIDEO_ID:
-                continue
-
-            if db_key.startswith("ytlive_"):
-                vid = db_key[7:]
-                msg_id = int(item.get("message_id", 0))
-                if msg_id:
-                    restore_tasks.append(
-                        restore_youtube_state(bot_instance, channel, vid, msg_id)
-                    )
-            elif db_key.startswith("yt_"):
-                vid = db_key[3:]
-                s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
-                if s_time < now - datetime.timedelta(
-                    days=2
-                ) or s_time > now + datetime.timedelta(days=45):
-                    continue
-                run_date = s_time - datetime.timedelta(minutes=3)
-                if run_date < now:
-                    run_date = now + datetime.timedelta(seconds=5)
-                bot_instance.schedule_youtube_sniper(vid, s_time, run_date)
-            elif db_key.startswith("tw_"):
-                s_id = db_key[3:]
-                login = item.get("login", "")
-                msg_id = int(item.get("message_id", 0))
-                stream_id = item.get("stream_id", "")
-                if msg_id:
-                    restore_tasks.append(
-                        restore_twitch_state(
-                            bot_instance, channel, s_id, login, msg_id, stream_id
-                        )
-                    )
+            # One corrupt row used to abort the whole restore. The rows that
+            # never made it into memory were then deleted by the next sync.
+            try:
+                _queue_restored_item(bot_instance, channel, item, now, restore_tasks)
+            except Exception:
+                logger.exception(
+                    "Skipping unreadable state item %s", item.get("video_id")
+                )
 
         # 3. Wait for ALL Discord messages to be fetched into memory before proceeding
         if restore_tasks:
