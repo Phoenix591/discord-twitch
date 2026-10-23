@@ -146,6 +146,27 @@ LEASE_VIDEO_ID = "lease"
 LEASE_TTL_SECONDS = 60
 LEASE_RENEW_SECONDS = 15
 _lease_held = False
+# Unix time when the lease we last confirmed will lapse. 0 means the flag was
+# set without a deadline (tests, or a process that has not acquired yet).
+_lease_until = 0
+
+
+def _lease_write_allowed() -> bool:
+    """False once the last confirmed lease has lapsed.
+
+    A failed renew used to leave _lease_held True, so this process kept
+    overwriting DynamoDB after another instance was allowed to take the row.
+    """
+    global _lease_held
+    if not _lease_held:
+        return False
+    if _lease_until and time.time() >= _lease_until:
+        _lease_held = False
+        logger.warning(
+            "State lease expired locally; skipping DynamoDB writes until it is renewed."
+        )
+        return False
+    return True
 
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
@@ -397,6 +418,43 @@ async def discord_channel():
 
 
 # --- Main Async Sync Functions ---
+def _queue_restored_item(bot_instance, channel, item, now, restore_tasks) -> None:
+    """Parse one state row into a scheduler job or a message restore."""
+    db_key = item["video_id"]
+    if db_key == LEASE_VIDEO_ID:
+        return
+
+    if db_key.startswith("ytlive_"):
+        vid = db_key[7:]
+        msg_id = int(item.get("message_id", 0))
+        if msg_id:
+            restore_tasks.append(
+                restore_youtube_state(bot_instance, channel, vid, msg_id)
+            )
+    elif db_key.startswith("yt_"):
+        vid = db_key[3:]
+        s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
+        if s_time < now - datetime.timedelta(days=2) or s_time > now + datetime.timedelta(
+            days=45
+        ):
+            return
+        run_date = s_time - datetime.timedelta(minutes=3)
+        if run_date < now:
+            run_date = now + datetime.timedelta(seconds=5)
+        bot_instance.schedule_youtube_sniper(vid, s_time, run_date)
+    elif db_key.startswith("tw_"):
+        s_id = db_key[3:]
+        login = item.get("login", "")
+        msg_id = int(item.get("message_id", 0))
+        stream_id = item.get("stream_id", "")
+        if msg_id:
+            restore_tasks.append(
+                restore_twitch_state(
+                    bot_instance, channel, s_id, login, msg_id, stream_id
+                )
+            )
+
+
 async def sync_state_from_dynamodb(bot_instance):
     try:
         logger.info("☁️  Downloading state from DynamoDB...")
@@ -413,39 +471,14 @@ async def sync_state_from_dynamodb(bot_instance):
         restore_tasks = []
 
         for item in items:
-            db_key = item["video_id"]
-            if db_key == LEASE_VIDEO_ID:
-                continue
-
-            if db_key.startswith("ytlive_"):
-                vid = db_key[7:]
-                msg_id = int(item.get("message_id", 0))
-                if msg_id:
-                    restore_tasks.append(
-                        restore_youtube_state(bot_instance, channel, vid, msg_id)
-                    )
-            elif db_key.startswith("yt_"):
-                vid = db_key[3:]
-                s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
-                if s_time < now - datetime.timedelta(
-                    days=2
-                ) or s_time > now + datetime.timedelta(days=45):
-                    continue
-                run_date = s_time - datetime.timedelta(minutes=3)
-                if run_date < now:
-                    run_date = now + datetime.timedelta(seconds=5)
-                bot_instance.schedule_youtube_sniper(vid, s_time, run_date)
-            elif db_key.startswith("tw_"):
-                s_id = db_key[3:]
-                login = item.get("login", "")
-                msg_id = int(item.get("message_id", 0))
-                stream_id = item.get("stream_id", "")
-                if msg_id:
-                    restore_tasks.append(
-                        restore_twitch_state(
-                            bot_instance, channel, s_id, login, msg_id, stream_id
-                        )
-                    )
+            # One corrupt row used to abort the whole restore. The rows that
+            # never made it into memory were then deleted by the next sync.
+            try:
+                _queue_restored_item(bot_instance, channel, item, now, restore_tasks)
+            except Exception:
+                logger.exception(
+                    "Skipping unreadable state item %s", item.get("video_id")
+                )
 
         # 3. Wait for ALL Discord messages to be fetched into memory before proceeding
         if restore_tasks:
@@ -461,13 +494,13 @@ async def sync_state_from_dynamodb(bot_instance):
 
 
 async def sync_state_to_dynamodb():
-    if not _lease_held:
+    if not _lease_write_allowed():
         logger.info(
             "Skipping DynamoDB sync; this process does not hold the state lease."
         )
         return
     async with _sync_lock:
-        if not _lease_held:
+        if not _lease_write_allowed():
             logger.info(
                 "Skipping DynamoDB sync; this process does not hold the state lease."
             )
@@ -528,7 +561,7 @@ async def sync_state_to_dynamodb():
 
 def _acquire_or_renew_lease() -> bool:
     """Take or extend the state lease. An expired row can be taken in place."""
-    global _lease_held
+    global _lease_held, _lease_until
     now = int(time.time())
     table = _dynamodb_table(DYNAMODB_TABLE_NAME)
     try:
@@ -548,9 +581,11 @@ def _acquire_or_renew_lease() -> bool:
         code = exc.response.get("Error", {}).get("Code")
         if code == "ConditionalCheckFailedException":
             _lease_held = False
+            _lease_until = 0
             return False
         raise
     _lease_held = True
+    _lease_until = now + LEASE_TTL_SECONDS
     return True
 
 
@@ -580,6 +615,9 @@ async def _renew_state_lease() -> None:
             raise
         except Exception:
             logger.exception("State lease renew failed")
+            # A timeout does not extend the row. Stop writing once the last
+            # confirmed deadline has passed so a replacement can take it.
+            _lease_write_allowed()
         else:
             if not held:
                 logger.warning(
@@ -594,7 +632,7 @@ async def _renew_state_lease() -> None:
 
 def _release_lease() -> None:
     """Delete our lease row. A missing lease, or one we do not hold, is a no-op."""
-    global _lease_held
+    global _lease_held, _lease_until
     if not _lease_held:
         return
     try:
@@ -610,6 +648,7 @@ def _release_lease() -> None:
         )
     finally:
         _lease_held = False
+        _lease_until = 0
 
 
 def _drop_unused_oauth_routes(router) -> None:
@@ -642,6 +681,29 @@ class EventSubAdapter(AiohttpAdapter):
         except ValueError:
             pass
         return response
+
+    async def run(self, host: str | None = None, port: int | None = None) -> None:
+        await super().run(host=host, port=port)
+        self._restore_shutdown_signals()
+
+    def _restore_shutdown_signals(self) -> None:
+        """Put our shutdown handler back after the web server binds.
+
+        AiohttpAdapter.run() installs AppRunner(handle_signals=True), which
+        replaces SIGTERM and SIGINT with a handler that raises SystemExit(1).
+        main() only treats KeyboardInterrupt as a clean stop, so systemd's
+        Restart=on-failure starts the bot again. The raise also cancels every
+        task, racing Discord close() against the Twitch client's own close().
+        """
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, discord_bot._on_sigterm)
+            except NotImplementedError:
+                logger.warning(
+                    "Signal handlers are unavailable; a service stop will not save state."
+                )
+                return
 
 
 # Main Hybrid Bot Class
@@ -1092,6 +1154,12 @@ class HybridBot(twitchio.Client):
                 )
             return
 
+        # A retry scheduled before videos.list knew the premiere used "now"
+        # as the start. Follow the real start instead of giving up 21 minutes
+        # later, or the stream never gets a sniper.
+        if await self._adopt_youtube_schedule(video_id, scheduled_time, data):
+            return
+
         if now < (scheduled_time + datetime.timedelta(minutes=3)):
             self.schedule_youtube_sniper(
                 video_id, scheduled_time, now + datetime.timedelta(seconds=90)
@@ -1103,6 +1171,39 @@ class HybridBot(twitchio.Client):
         else:
             logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
             await sync_state_to_dynamodb()
+
+    async def _adopt_youtube_schedule(self, video_id, scheduled_time, data) -> bool:
+        """Requeue the sniper when YouTube's start time disagrees with the job.
+
+        True means this attempt is finished (requeued or dropped).
+        """
+        live_details = data.get("liveStreamingDetails") or {}
+        if live_details.get("actualEndTime"):
+            logger.info(f"   🛑 Giving up on {video_id}: broadcast already ended.")
+            await sync_state_to_dynamodb()
+            return True
+        scheduled_start = live_details.get("scheduledStartTime")
+        if not scheduled_start:
+            return False
+        dt = datetime.datetime.fromisoformat(scheduled_start.replace("Z", "+00:00"))
+        if abs(dt - scheduled_time) <= datetime.timedelta(minutes=1):
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if dt > now + datetime.timedelta(days=45) or dt < now - datetime.timedelta(
+            days=2
+        ):
+            logger.info(
+                f"   🛑 Giving up on {video_id}: schedule {dt} is outside the tracking window."
+            )
+            await sync_state_to_dynamodb()
+            return True
+        run_time = dt - datetime.timedelta(minutes=3)
+        if run_time < now:
+            run_time = now + datetime.timedelta(seconds=10)
+        logger.info(f"   🗓️ {video_id} is scheduled for {dt}. Queueing sniper.")
+        self.schedule_youtube_sniper(video_id, dt, run_time)
+        await sync_state_to_dynamodb()
+        return True
 
     async def check_youtube_offline(self, video_id):
         if video_id not in youtube_active_messages:
@@ -1123,15 +1224,15 @@ class HybridBot(twitchio.Client):
             return
         try:
             if msg is not None:
-                old_embed = msg.embeds[0]
+                old_embed = msg.embeds[0] if msg.embeds else None
                 new_embed = discord.Embed(
-                    title=old_embed.title,
-                    url=old_embed.url,
+                    title=old_embed.title if old_embed is not None else "Stream ended",
+                    url=old_embed.url if old_embed is not None else None,
                     description="**Stream Ended**",
                     color=0x2C2F33,
                     timestamp=datetime.datetime.now(datetime.timezone.utc),
                 )
-                if old_embed.image:
+                if old_embed is not None and old_embed.image:
                     new_embed.set_image(url=old_embed.image.url)
                 await msg.edit(content=None, embed=new_embed)
         except discord.NotFound:
@@ -1141,6 +1242,7 @@ class HybridBot(twitchio.Client):
             return
         except Exception as e:
             logger.error(f"Failed to edit offline message for {video_id}: {e}")
+            return  # keep tracking until a later check can edit the message
 
         if video_id in youtube_active_messages:
             del youtube_active_messages[video_id]
@@ -1168,6 +1270,26 @@ class HybridBot(twitchio.Client):
                 raise Exception(f"YouTube API Error {resp.status}")
             js = await resp.json()
             return js["items"][0] if js["items"] else None
+
+    def _set_twitch_stream_id(self, s_id: str, stream_id) -> bool:
+        """Record a Helix stream id. True when the caller should persist it.
+
+        Caller must hold _twitch_lock for s_id. An in-flight placeholder is
+        left alone. A bare message id is remembered in memory only, because
+        sync would keep the existing row untouched.
+        """
+        new_id = str(stream_id or "")
+        if not new_id:
+            return False
+        msg = twitch_active_messages.get(s_id)
+        if msg is None or msg == 0:
+            return False
+        changed = twitch_active_stream_ids.get(s_id) != new_id
+        if changed:
+            twitch_active_stream_ids[s_id] = new_id
+        if isinstance(msg, int):
+            return False
+        return changed
 
     def _twitch_ended_embed(self, s_login: str) -> discord.Embed:
         ts = int(datetime.datetime.now().timestamp())
@@ -1480,7 +1602,9 @@ class HybridBot(twitchio.Client):
                         continue
                     if s_id in twitch_active_messages:
                         if stream.id:
-                            twitch_active_stream_ids[s_id] = str(stream.id)
+                            async with _twitch_lock(s_id):
+                                if self._set_twitch_stream_id(s_id, stream.id):
+                                    await sync_state_to_dynamodb()
                         continue
                     s_login = stream.user.name or TWITCH_STREAMERS.get(s_id, s_id)
                     await self._handle_twitch_online(
@@ -1612,16 +1736,25 @@ class HybridBot(twitchio.Client):
                         await sync_state_to_dynamodb()
                     return
 
-                # Update the stream ID from the API fetch just in case it wasn't caught
+                # Update the stream ID from the API fetch just in case it wasn't caught.
+                # Persist a change once the Discord message is in hand. The id is
+                # what a later offline event is compared against.
                 current_stream_id = getattr(streams[0], "id", None)
+                previous_stream_id = twitch_active_stream_ids.get(s_id, "")
                 if current_stream_id:
-                    twitch_active_stream_ids[s_id] = str(current_stream_id)
+                    self._set_twitch_stream_id(s_id, current_stream_id)
 
                 msg = await self._resolve_stored_message(twitch_active_messages, s_id)
                 if msg is None:
                     twitch_active_messages.pop(s_id, None)
                     twitch_active_stream_ids.pop(s_id, None)
                     return
+                if (
+                    current_stream_id
+                    and str(current_stream_id) != previous_stream_id
+                    and not isinstance(msg, int)
+                ):
+                    await sync_state_to_dynamodb()
                 if msg and not isinstance(msg, int):
                     await msg.edit(embed=self.build_twitch_embed(s_login, streams[0]))
                 if twitch_active_messages.get(s_id) is not msg:
