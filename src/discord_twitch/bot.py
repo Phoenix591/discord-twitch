@@ -125,6 +125,8 @@ def youtube_broadcast_ended(data) -> bool | None:
     if actual_end or content == "none":
         return True
     return None
+
+
 # misfire_grace_time of 1 second drops date jobs that are already due when start()
 # runs. None means run them no matter how late they are.
 scheduler = AsyncIOScheduler(
@@ -167,6 +169,7 @@ def _lease_write_allowed() -> bool:
         )
         return False
     return True
+
 
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
@@ -311,7 +314,9 @@ def load_config():
     if not tw_secret:
         logger.info("No EventSub secret in config; generated one for this process.")
     if not yt_secret:
-        logger.info("No YouTube webhook secret in config; generated one for this process.")
+        logger.info(
+            "No YouTube webhook secret in config; generated one for this process."
+        )
 
 
 async def restore_twitch_state(
@@ -434,9 +439,9 @@ def _queue_restored_item(bot_instance, channel, item, now, restore_tasks) -> Non
     elif db_key.startswith("yt_"):
         vid = db_key[3:]
         s_time = datetime.datetime.fromisoformat(item["scheduled_time"])
-        if s_time < now - datetime.timedelta(days=2) or s_time > now + datetime.timedelta(
-            days=45
-        ):
+        if s_time < now - datetime.timedelta(
+            days=2
+        ) or s_time > now + datetime.timedelta(days=45):
             return
         run_date = s_time - datetime.timedelta(minutes=3)
         if run_date < now:
@@ -551,9 +556,7 @@ async def sync_state_to_dynamodb():
                     "video_id": f"ytlive_{vid}",
                     "message_id": m_id,
                 }
-            await asyncio.to_thread(
-                _db_push, jobs_data, tw_data, yt_data, pending_ids
-            )
+            await asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data, pending_ids)
             logger.info("☁️  State synced to DynamoDB.")
         except Exception as e:
             logger.error(f"❌ DynamoDB Sync failed: {e}")
@@ -567,10 +570,11 @@ def _acquire_or_renew_lease() -> bool:
     try:
         table.update_item(
             Key={"video_id": LEASE_VIDEO_ID},
-            UpdateExpression="SET owner = :o, expires_at = :e",
+            UpdateExpression="SET #owner = :o, expires_at = :e",
             ConditionExpression=(
-                "attribute_not_exists(expires_at) OR expires_at < :now OR owner = :o"
+                "attribute_not_exists(expires_at) OR expires_at < :now OR #owner = :o"
             ),
+            ExpressionAttributeNames={"#owner": "owner"},
             ExpressionAttributeValues={
                 ":o": INSTANCE_ID,
                 ":e": now + LEASE_TTL_SECONDS,
@@ -600,9 +604,7 @@ async def wait_for_lease() -> None:
             raise
         except Exception:
             logger.exception("State lease acquire failed")
-        logger.info(
-            "State lease held by another instance; waiting for it to expire."
-        )
+        logger.info("State lease held by another instance; waiting for it to expire.")
         await asyncio.sleep(LEASE_RENEW_SECONDS)
 
 
@@ -643,9 +645,7 @@ def _release_lease() -> None:
             ExpressionAttributeValues={":o": INSTANCE_ID},
         )
     except Exception:
-        logger.exception(
-            "Failed to release state lease; it will expire on its own."
-        )
+        logger.exception("Failed to release state lease; it will expire on its own.")
     finally:
         _lease_held = False
         _lease_until = 0
@@ -1123,7 +1123,9 @@ class HybridBot(twitchio.Client):
             logger.error(f"API Error sniper {video_id}: {e}")
             # The date job has already been consumed. Give up once the old window
             # has passed so a dead video cannot poll every 90 seconds forever.
-            await self._retry_youtube_later(video_id, save=False, scheduled_time=scheduled_time)
+            await self._retry_youtube_later(
+                video_id, save=False, scheduled_time=scheduled_time
+            )
             return
         if not data:
             if self._youtube_retry_expired(scheduled_time, now):
@@ -1299,7 +1301,9 @@ class HybridBot(twitchio.Client):
             color=0x2C2F33,
         )
 
-    def _schedule_twitch_check(self, s_id: str, s_login: str, delay: int = 3600) -> None:
+    def _schedule_twitch_check(
+        self, s_id: str, s_login: str, delay: int = 3600
+    ) -> None:
         existing = twitch_active_tasks.get(s_id)
         current = asyncio.current_task()
         if existing is not None and existing is not current and not existing.done():
@@ -1392,16 +1396,16 @@ class HybridBot(twitchio.Client):
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
             )
             thumbs = data["snippet"].get("thumbnails") or {}
-            thumb = (
-                thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default")
-            )
+            thumb = thumbs.get("maxres") or thumbs.get("high") or thumbs.get("default")
             if thumb and thumb.get("url"):
                 embed.set_image(url=thumb["url"])
 
             chan = await discord_channel()
             if not chan:
                 youtube_active_messages.pop(vid_id, None)
-                logger.error("Failed to send youtube message: Discord channel unavailable")
+                logger.error(
+                    "Failed to send youtube message: Discord channel unavailable"
+                )
                 return False
             msg = await chan.send(
                 content=f"{title_prefix} **{channel_name}** is LIVE! {url}",
@@ -1417,7 +1421,9 @@ class HybridBot(twitchio.Client):
         try:
             self.schedule_youtube_monitor(vid_id, immediate=False)
         except Exception as e:
-            logger.error(f"YouTube alert for {vid_id} was sent, but the monitor was not scheduled: {e}")
+            logger.error(
+                f"YouTube alert for {vid_id} was sent, but the monitor was not scheduled: {e}"
+            )
         await sync_state_to_dynamodb()
         return True
 
@@ -1681,9 +1687,7 @@ class HybridBot(twitchio.Client):
         if not chan:
             twitch_active_messages.pop(s_id, None)
             twitch_active_stream_ids.pop(s_id, None)
-            logger.error(
-                f"Failed to announce {s_login}: Discord channel unavailable"
-            )
+            logger.error(f"Failed to announce {s_login}: Discord channel unavailable")
             return False
         try:
             msg = await chan.send(
@@ -1870,9 +1874,7 @@ class HybridBot(twitchio.Client):
             if removed_tw:
                 # Drop subscriptions for the removed broadcasters, then resubscribe
                 # to whoever is still tracked. Other apps on this client id are kept.
-                logger.info(
-                    "   Dropping removed Twitch EventSubs and resubscribing..."
-                )
+                logger.info("   Dropping removed Twitch EventSubs and resubscribing...")
                 await self.setup_twitch_subs()
                 # Subscriptions for the channels we still track are left in place.
                 # Sweep them in case one went live while subscribe calls were running.
