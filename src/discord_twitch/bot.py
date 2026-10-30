@@ -641,7 +641,10 @@ def _release_lease() -> None:
         table = _dynamodb_table(DYNAMODB_TABLE_NAME)
         table.delete_item(
             Key={"video_id": LEASE_VIDEO_ID},
-            ConditionExpression="owner = :o",
+            # "owner" is a reserved word. A bare name raises ValidationException
+            # and the next process waits out the TTL after every graceful stop.
+            ConditionExpression="#owner = :o",
+            ExpressionAttributeNames={"#owner": "owner"},
             ExpressionAttributeValues={":o": INSTANCE_ID},
         )
     except Exception:
