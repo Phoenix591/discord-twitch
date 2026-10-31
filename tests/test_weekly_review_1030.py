@@ -1,45 +1,19 @@
 """Regression tests for the 2026-10-30 review.
 
-Findings that the fix PR addresses are xfail on main and run for real once
-that code is present. Delete the xfail markers after the fix merges.
+test_graceful_release_deletes_the_lease_row and
+test_sync_during_a_sniper_fetch_keeps_the_premiere cover the companion fix.
+They fail on main until that change is present, and they stay plain tests
+because the fix is already in a pending PR.
 """
 
 import asyncio
 import datetime
-import inspect
 import re
 
 import pytest
 from botocore.exceptions import ClientError
 
 from discord_twitch import bot
-
-
-def _fixed_lease_release() -> bool:
-    return "#owner" in inspect.getsource(bot._release_lease)
-
-
-def _fixed_sniper_hold() -> bool:
-    return hasattr(bot, "_youtube_checks_in_flight")
-
-
-_XFAIL_LEASE = pytest.mark.xfail(
-    not _fixed_lease_release(),
-    strict=True,
-    reason=(
-        "Releasing the state lease sends a bare owner attribute, which "
-        "DynamoDB rejects, so the row stays until the TTL. Remove this xfail "
-        "once the fix PR merges."
-    ),
-)
-_XFAIL_SNIPER = pytest.mark.xfail(
-    not _fixed_sniper_hold(),
-    strict=True,
-    reason=(
-        "A state sync while a YouTube sniper is awaiting videos.list deletes "
-        "that premiere. Remove this xfail once the fix PR merges."
-    ),
-)
 
 
 def _reset():
@@ -155,7 +129,6 @@ def _install_state(monkeypatch, store):
     monkeypatch.setattr(bot, "_dynamodb_table", lambda name: _StateTable(store))
 
 
-@_XFAIL_LEASE
 def test_graceful_release_deletes_the_lease_row(monkeypatch):
     table = _LeaseTable(
         {"video_id": "lease", "owner": bot.INSTANCE_ID, "expires_at": 1}
@@ -182,7 +155,6 @@ def test_release_does_not_delete_another_owners_lease(monkeypatch):
     assert bot._lease_held is False
 
 
-@_XFAIL_SNIPER
 def test_sync_during_a_sniper_fetch_keeps_the_premiere(monkeypatch):
     store = {"yt_premiere": {"video_id": "yt_premiere", "scheduled_time": "old"}}
     _install_state(monkeypatch, store)
