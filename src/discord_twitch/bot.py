@@ -171,6 +171,17 @@ def _lease_write_allowed() -> bool:
     return True
 
 
+# Sniper date jobs leave the scheduler before the coroutine runs. A sync during
+# the YouTube request would otherwise delete that premiere, and a restart before
+# the next sync would not bring it back. Values are state-table keys (yt_<id>).
+_youtube_checks_in_flight: set[str] = set()
+
+
+def _release_youtube_check(video_id: str) -> None:
+    """Stop protecting a sniper row so the next sync can delete it."""
+    _youtube_checks_in_flight.discard(f"yt_{video_id}")
+
+
 # Config Placeholders
 DYNAMODB_REGION = "us-east-1"
 DYNAMODB_TABLE_NAME = ""
@@ -522,7 +533,8 @@ async def sync_state_to_dynamodb():
                     except IndexError:
                         pass
 
-            pending_ids = set()
+            # Copy. A sniper can leave the set while the write is in flight.
+            pending_ids = set(_youtube_checks_in_flight)
             tw_data = {}
             for s_id, msg in list(twitch_active_messages.items()):
                 if msg is None or msg == 0 or isinstance(msg, int):
@@ -641,7 +653,10 @@ def _release_lease() -> None:
         table = _dynamodb_table(DYNAMODB_TABLE_NAME)
         table.delete_item(
             Key={"video_id": LEASE_VIDEO_ID},
-            ConditionExpression="owner = :o",
+            # "owner" is a reserved word. A bare name raises ValidationException
+            # and the next process waits out the TTL after every graceful stop.
+            ConditionExpression="#owner = :o",
+            ExpressionAttributeNames={"#owner": "owner"},
             ExpressionAttributeValues={":o": INSTANCE_ID},
         )
     except Exception:
@@ -1107,72 +1122,89 @@ class HybridBot(twitchio.Client):
         when = scheduled_time or now
         if scheduled_time is not None and self._youtube_retry_expired(when, now):
             logger.info(f"   🛑 Giving up on {video_id} after repeated failures.")
+            # Release before the sync so the sniper row is actually removed.
+            _release_youtube_check(video_id)
             await sync_state_to_dynamodb()
             return
         self.schedule_youtube_sniper(
             video_id, when, now + datetime.timedelta(seconds=90)
         )
         if save:
+            _release_youtube_check(video_id)
             await sync_state_to_dynamodb()
 
     async def check_youtube_status(self, video_id, scheduled_time):
-        now = datetime.datetime.now(datetime.timezone.utc)
+        # Hold the row before the first await. APScheduler has already removed
+        # this date job, so pending_ids is the only thing keeping it.
+        _youtube_checks_in_flight.add(f"yt_{video_id}")
         try:
-            data = await self.fetch_youtube_data(video_id)
-        except Exception as e:
-            logger.error(f"API Error sniper {video_id}: {e}")
-            # The date job has already been consumed. Give up once the old window
-            # has passed so a dead video cannot poll every 90 seconds forever.
-            await self._retry_youtube_later(
-                video_id, save=False, scheduled_time=scheduled_time
-            )
-            return
-        if not data:
-            if self._youtube_retry_expired(scheduled_time, now):
-                logger.info(f"   🛑 Giving up on {video_id} (video not found).")
-                await sync_state_to_dynamodb()
-                return
-            logger.info(f"   ⏳ {video_id} is not in the API yet. Retrying.")
-            self.schedule_youtube_sniper(
-                video_id, scheduled_time, now + datetime.timedelta(seconds=90)
-            )
-            return
-
-        channel_id = data["snippet"].get("channelId")
-        if channel_id not in YOUTUBE_STREAMERS:
-            logger.info(
-                f"   🛑 Giving up on {video_id}: channel {channel_id} is no longer tracked."
-            )
-            await sync_state_to_dynamodb()
-            return
-
-        is_live = data["snippet"].get("liveBroadcastContent") == "live"
-
-        if is_live:
-            logger.info(f"🎯 Sniper Hit! {video_id} is LIVE.")
-            if not await self.send_youtube_notification(data):
+            now = datetime.datetime.now(datetime.timezone.utc)
+            try:
+                data = await self.fetch_youtube_data(video_id)
+            except Exception as e:
+                logger.error(f"API Error sniper {video_id}: {e}")
+                # The date job has already been consumed. Give up once the old
+                # window has passed so a dead video cannot poll forever.
                 await self._retry_youtube_later(
                     video_id, save=False, scheduled_time=scheduled_time
                 )
-            return
+                return
+            if not data:
+                if self._youtube_retry_expired(scheduled_time, now):
+                    logger.info(f"   🛑 Giving up on {video_id} (video not found).")
+                    _release_youtube_check(video_id)
+                    await sync_state_to_dynamodb()
+                    return
+                logger.info(f"   ⏳ {video_id} is not in the API yet. Retrying.")
+                self.schedule_youtube_sniper(
+                    video_id, scheduled_time, now + datetime.timedelta(seconds=90)
+                )
+                return
 
-        # A retry scheduled before videos.list knew the premiere used "now"
-        # as the start. Follow the real start instead of giving up 21 minutes
-        # later, or the stream never gets a sniper.
-        if await self._adopt_youtube_schedule(video_id, scheduled_time, data):
-            return
+            channel_id = data["snippet"].get("channelId")
+            if channel_id not in YOUTUBE_STREAMERS:
+                logger.info(
+                    f"   🛑 Giving up on {video_id}: channel {channel_id} is no longer tracked."
+                )
+                _release_youtube_check(video_id)
+                await sync_state_to_dynamodb()
+                return
 
-        if now < (scheduled_time + datetime.timedelta(minutes=3)):
-            self.schedule_youtube_sniper(
-                video_id, scheduled_time, now + datetime.timedelta(seconds=90)
-            )
-        elif now < (scheduled_time + datetime.timedelta(minutes=21)):
-            self.schedule_youtube_sniper(
-                video_id, scheduled_time, now + datetime.timedelta(minutes=3)
-            )
-        else:
-            logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
-            await sync_state_to_dynamodb()
+            is_live = data["snippet"].get("liveBroadcastContent") == "live"
+
+            if is_live:
+                logger.info(f"🎯 Sniper Hit! {video_id} is LIVE.")
+                if not await self.send_youtube_notification(data):
+                    await self._retry_youtube_later(
+                        video_id, save=False, scheduled_time=scheduled_time
+                    )
+                    return
+                # send_youtube_notification synced while this id was in flight,
+                # which keeps the sniper row. Drop it now that the monitor owns it.
+                _release_youtube_check(video_id)
+                await sync_state_to_dynamodb()
+                return
+
+            # A retry scheduled before videos.list knew the premiere used "now"
+            # as the start. Follow the real start instead of giving up 21 minutes
+            # later, or the stream never gets a sniper.
+            if await self._adopt_youtube_schedule(video_id, scheduled_time, data):
+                return
+
+            if now < (scheduled_time + datetime.timedelta(minutes=3)):
+                self.schedule_youtube_sniper(
+                    video_id, scheduled_time, now + datetime.timedelta(seconds=90)
+                )
+            elif now < (scheduled_time + datetime.timedelta(minutes=21)):
+                self.schedule_youtube_sniper(
+                    video_id, scheduled_time, now + datetime.timedelta(minutes=3)
+                )
+            else:
+                logger.info(f"   🛑 Giving up on {video_id} (Never went live).")
+                _release_youtube_check(video_id)
+                await sync_state_to_dynamodb()
+        finally:
+            _youtube_checks_in_flight.discard(f"yt_{video_id}")
 
     async def _adopt_youtube_schedule(self, video_id, scheduled_time, data) -> bool:
         """Requeue the sniper when YouTube's start time disagrees with the job.
@@ -1182,6 +1214,7 @@ class HybridBot(twitchio.Client):
         live_details = data.get("liveStreamingDetails") or {}
         if live_details.get("actualEndTime"):
             logger.info(f"   🛑 Giving up on {video_id}: broadcast already ended.")
+            _release_youtube_check(video_id)
             await sync_state_to_dynamodb()
             return True
         scheduled_start = live_details.get("scheduledStartTime")
@@ -1197,6 +1230,7 @@ class HybridBot(twitchio.Client):
             logger.info(
                 f"   🛑 Giving up on {video_id}: schedule {dt} is outside the tracking window."
             )
+            _release_youtube_check(video_id)
             await sync_state_to_dynamodb()
             return True
         run_time = dt - datetime.timedelta(minutes=3)
@@ -1204,6 +1238,7 @@ class HybridBot(twitchio.Client):
             run_time = now + datetime.timedelta(seconds=10)
         logger.info(f"   🗓️ {video_id} is scheduled for {dt}. Queueing sniper.")
         self.schedule_youtube_sniper(video_id, dt, run_time)
+        _release_youtube_check(video_id)
         await sync_state_to_dynamodb()
         return True
 
