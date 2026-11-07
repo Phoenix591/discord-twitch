@@ -103,6 +103,7 @@ def _reset():
     bot.TWITCH_STREAMERS.clear()
     bot.YOUTUBE_STREAMERS.clear()
     bot._lease_held = True
+    bot._lease_closing = False
     if hasattr(bot, "_lease_until"):
         bot._lease_until = 0
     for job in bot.scheduler.get_jobs():

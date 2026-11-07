@@ -21,6 +21,7 @@ import time
 import hmac
 import hashlib
 import secrets
+import threading
 import uuid
 
 from discord_twitch.config import dynamodb_settings, load_parser
@@ -151,6 +152,11 @@ _lease_held = False
 # Unix time when the lease we last confirmed will lapse. 0 means the flag was
 # set without a deadline (tests, or a process that has not acquired yet).
 _lease_until = 0
+# Renew runs in a thread. close() can cancel that task without stopping the
+# thread, so the update and the delete have to take this lock. Once close()
+# starts the delete, a late renew must not write the row back.
+_lease_lock = threading.Lock()
+_lease_closing = False
 
 
 def _lease_write_allowed() -> bool:
@@ -568,8 +574,24 @@ async def sync_state_to_dynamodb():
                     "video_id": f"ytlive_{vid}",
                     "message_id": m_id,
                 }
-            await asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data, pending_ids)
+            # close() cancels autosave, which is often inside this write, then
+            # syncs again. Cancellation drops the lock while the thread is
+            # still in batch_writer, so the two writes delete each other's rows.
+            # Finish the in-flight write before releasing the lock.
+            push = asyncio.create_task(
+                asyncio.to_thread(_db_push, jobs_data, tw_data, yt_data, pending_ids)
+            )
+            try:
+                await asyncio.shield(push)
+            except asyncio.CancelledError:
+                try:
+                    await push
+                except Exception:
+                    logger.exception("DynamoDB sync failed during cancellation")
+                raise
             logger.info("☁️  State synced to DynamoDB.")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"❌ DynamoDB Sync failed: {e}")
 
@@ -577,32 +599,37 @@ async def sync_state_to_dynamodb():
 def _acquire_or_renew_lease() -> bool:
     """Take or extend the state lease. An expired row can be taken in place."""
     global _lease_held, _lease_until
-    now = int(time.time())
-    table = _dynamodb_table(DYNAMODB_TABLE_NAME)
-    try:
-        table.update_item(
-            Key={"video_id": LEASE_VIDEO_ID},
-            UpdateExpression="SET #owner = :o, expires_at = :e",
-            ConditionExpression=(
-                "attribute_not_exists(expires_at) OR expires_at < :now OR #owner = :o"
-            ),
-            ExpressionAttributeNames={"#owner": "owner"},
-            ExpressionAttributeValues={
-                ":o": INSTANCE_ID,
-                ":e": now + LEASE_TTL_SECONDS,
-                ":now": now,
-            },
-        )
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code == "ConditionalCheckFailedException":
-            _lease_held = False
-            _lease_until = 0
+    with _lease_lock:
+        # close() sets this before deleting. A renew thread that was already
+        # past task.cancel() would otherwise recreate the row afterward.
+        if _lease_closing:
             return False
-        raise
-    _lease_held = True
-    _lease_until = now + LEASE_TTL_SECONDS
-    return True
+        now = int(time.time())
+        table = _dynamodb_table(DYNAMODB_TABLE_NAME)
+        try:
+            table.update_item(
+                Key={"video_id": LEASE_VIDEO_ID},
+                UpdateExpression="SET #owner = :o, expires_at = :e",
+                ConditionExpression=(
+                    "attribute_not_exists(expires_at) OR expires_at < :now OR #owner = :o"
+                ),
+                ExpressionAttributeNames={"#owner": "owner"},
+                ExpressionAttributeValues={
+                    ":o": INSTANCE_ID,
+                    ":e": now + LEASE_TTL_SECONDS,
+                    ":now": now,
+                },
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code == "ConditionalCheckFailedException":
+                _lease_held = False
+                _lease_until = 0
+                return False
+            raise
+        _lease_held = True
+        _lease_until = now + LEASE_TTL_SECONDS
+        return True
 
 
 async def wait_for_lease() -> None:
@@ -646,24 +673,28 @@ async def _renew_state_lease() -> None:
 
 def _release_lease() -> None:
     """Delete our lease row. A missing lease, or one we do not hold, is a no-op."""
-    global _lease_held, _lease_until
-    if not _lease_held:
-        return
-    try:
-        table = _dynamodb_table(DYNAMODB_TABLE_NAME)
-        table.delete_item(
-            Key={"video_id": LEASE_VIDEO_ID},
-            # "owner" is a reserved word. A bare name raises ValidationException
-            # and the next process waits out the TTL after every graceful stop.
-            ConditionExpression="#owner = :o",
-            ExpressionAttributeNames={"#owner": "owner"},
-            ExpressionAttributeValues={":o": INSTANCE_ID},
-        )
-    except Exception:
-        logger.exception("Failed to release state lease; it will expire on its own.")
-    finally:
-        _lease_held = False
-        _lease_until = 0
+    global _lease_held, _lease_until, _lease_closing
+    with _lease_lock:
+        _lease_closing = True
+        if not _lease_held:
+            return
+        try:
+            table = _dynamodb_table(DYNAMODB_TABLE_NAME)
+            table.delete_item(
+                Key={"video_id": LEASE_VIDEO_ID},
+                # "owner" is a reserved word. A bare name raises ValidationException
+                # and the next process waits out the TTL after every graceful stop.
+                ConditionExpression="#owner = :o",
+                ExpressionAttributeNames={"#owner": "owner"},
+                ExpressionAttributeValues={":o": INSTANCE_ID},
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release state lease; it will expire on its own."
+            )
+        finally:
+            _lease_held = False
+            _lease_until = 0
 
 
 def _drop_unused_oauth_routes(router) -> None:

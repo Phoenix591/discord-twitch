@@ -55,6 +55,7 @@ def _reset_trackers():
     bot.TWITCH_STREAMERS.clear()
     bot.YOUTUBE_STREAMERS.clear()
     bot._lease_held = True
+    bot._lease_closing = False
     for job in bot.scheduler.get_jobs():
         job.remove()
 
