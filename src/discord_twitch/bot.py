@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from aiohttp import web, ClientSession, TCPConnector
 from discord.ext import tasks
+from apscheduler.events import EVENT_JOB_SUBMITTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import twitchio
 from twitchio.web import AiohttpAdapter
@@ -181,6 +182,25 @@ def _lease_write_allowed() -> bool:
 # the YouTube request would otherwise delete that premiere, and a restart before
 # the next sync would not bring it back. Values are state-table keys (yt_<id>).
 _youtube_checks_in_flight: set[str] = set()
+
+
+def _hold_submitted_sniper(event) -> None:
+    """Keep a premiere row across the gap after its date job leaves the store.
+
+    _process_jobs removes a one-shot job, then dispatches EVENT_JOB_SUBMITTED,
+    and only then returns to the event loop. The coroutine was queued with
+    create_task and cannot run until that callback finishes. A state sync on
+    the next turn would otherwise see neither the job nor an in-flight check
+    and delete the premiere.
+    """
+    job_id = event.job_id
+    if isinstance(job_id, str) and job_id.startswith("yt_") and not job_id.startswith(
+        "yt_monitor_"
+    ):
+        _youtube_checks_in_flight.add(job_id)
+
+
+scheduler.add_listener(_hold_submitted_sniper, EVENT_JOB_SUBMITTED)
 
 
 def _release_youtube_check(video_id: str) -> None:
@@ -769,6 +789,11 @@ class HybridBot(twitchio.Client):
         self._twitch_sub_failed: set[str] = set()
         self._youtube_wake = asyncio.Event()
         self._youtube_maint_task: asyncio.Task | None = None
+        # Client.start binds the webhook server before event_ready restores
+        # state. Hold notifications until that restore finishes.
+        self._startup_hold = False
+        self._deferred: list[tuple] = []
+        self._defer_lock = asyncio.Lock()
         super().__init__(
             client_id=TWITCH_CLIENT_ID,
             client_secret=TWITCH_CLIENT_SECRET,
@@ -787,14 +812,63 @@ class HybridBot(twitchio.Client):
             logger.info(f"Registered takeover handler")
             _drop_unused_oauth_routes(self.web_adapter.router)
 
+    async def start(self, *args, **kwargs):
+        # The HTTP server accepts EventSub and WebSub before event_ready runs.
+        # Hold those notifications until restore has the previous alerts in memory.
+        self._startup_hold = True
+        await super().start(*args, **kwargs)
+
+    async def _defer_startup(self, kind: str, payload) -> bool:
+        """Queue one notification when startup restore has not finished.
+
+        True means the caller should not handle it now. event_ready replays
+        the queue after the state table is back in memory.
+        """
+        if not self._startup_hold:
+            return False
+        async with self._defer_lock:
+            if not self._startup_hold:
+                return False
+            self._deferred.append((kind, payload))
+            return True
+
+    async def _replay_deferred(self, queued) -> None:
+        if not queued:
+            return
+        logger.info("Replaying %s notification(s) held during startup.", len(queued))
+        for kind, payload in queued:
+            try:
+                if kind == "online":
+                    await self.event_stream_online(payload)
+                elif kind == "offline":
+                    await self.event_stream_offline(payload)
+                elif kind == "youtube":
+                    video_id, channel_id = payload
+                    # Same filter as the live webhook. Channels are loaded
+                    # during the restore this queue was waiting on.
+                    if channel_id in YOUTUBE_STREAMERS:
+                        await self.initial_youtube_check(video_id)
+            except Exception:
+                logger.exception("Deferred %s notification failed", kind)
+
     async def event_ready(self) -> None:
         logger.info(f"✅ Hybrid Bot Listening on {LOCAL_PORT} (IPv4)")
         conn = TCPConnector(family=socket.AF_INET)
         self.session = ClientSession(connector=conn)
 
-        await discord_bot.wait_until_ready()
-        await self.reconcile_streamers(initial=True)
-        await sync_state_from_dynamodb(self)
+        # start() already holds, including the gap before this task runs.
+        # Setting it again covers an event_ready that did not come from start().
+        self._startup_hold = True
+        try:
+            await discord_bot.wait_until_ready()
+            await self.reconcile_streamers(initial=True)
+            await sync_state_from_dynamodb(self)
+        finally:
+            async with self._defer_lock:
+                self._startup_hold = False
+                queued = self._deferred
+                self._deferred = []
+            await self._replay_deferred(queued)
         if not scheduler.running:
             scheduler.start()
         await self.setup_twitch_subs()
@@ -961,7 +1035,13 @@ class HybridBot(twitchio.Client):
                 if vid_elem is not None and cid_elem is not None:
                     video_id = vid_elem.text
                     channel_id = cid_elem.text
-                    if channel_id in YOUTUBE_STREAMERS:
+                    # Streamers are loaded in event_ready, after the server is
+                    # already accepting posts. Queue the video until then.
+                    if video_id and await self._defer_startup(
+                        "youtube", (video_id, channel_id)
+                    ):
+                        pass
+                    elif video_id and channel_id in YOUTUBE_STREAMERS:
                         asyncio.create_task(self.initial_youtube_check(video_id))
         except Exception as e:
             logger.error(f"YouTube XML Parse Error: {e}")
@@ -1167,6 +1247,7 @@ class HybridBot(twitchio.Client):
     async def check_youtube_status(self, video_id, scheduled_time):
         # Hold the row before the first await. APScheduler has already removed
         # this date job, so pending_ids is the only thing keeping it.
+        # _hold_submitted_sniper adds the same id before this coroutine starts.
         _youtube_checks_in_flight.add(f"yt_{video_id}")
         try:
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -1625,6 +1706,8 @@ class HybridBot(twitchio.Client):
             await self._subscribe_twitch(s_id, s_name)
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
+        if await self._defer_startup("offline", payload):
+            return
         s_id = str(payload.broadcaster.id)
         s_login = payload.broadcaster.name or TWITCH_STREAMERS.get(s_id, s_id)
         stream_id = str(getattr(payload, "id", "") or "")
@@ -1647,6 +1730,8 @@ class HybridBot(twitchio.Client):
         # Premieres, reruns, playlists, and watch parties are not a live broadcast.
         if payload.type != "live":
             logger.info(f"   ℹ️ Ignoring {payload.type} event for {s_login}")
+            return
+        if await self._defer_startup("online", payload):
             return
         await self._handle_twitch_online(s_id, s_login, payload.id)
 
