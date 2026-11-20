@@ -792,8 +792,15 @@ class HybridBot(twitchio.Client):
         # Client.start binds the webhook server before event_ready restores
         # state. Hold notifications until that restore finishes.
         self._startup_hold = False
+        self._startup_ready = asyncio.Event()
+        self._startup_ready.set()
         self._deferred: list[tuple] = []
         self._defer_lock = asyncio.Lock()
+        self._deferred_tasks: set[asyncio.Task] = set()
+        # Stream ids retired between restore and the startup sweep. That sweep
+        # must not announce them again while Helix still lists them.
+        self._startup_offline_ids: set[tuple[str, str]] = set()
+        self._record_startup_offlines = False
         super().__init__(
             client_id=TWITCH_CLIENT_ID,
             client_secret=TWITCH_CLIENT_SECRET,
@@ -816,6 +823,7 @@ class HybridBot(twitchio.Client):
         # The HTTP server accepts EventSub and WebSub before event_ready runs.
         # Hold those notifications until restore has the previous alerts in memory.
         self._startup_hold = True
+        self._startup_ready.clear()
         await super().start(*args, **kwargs)
 
     async def _defer_startup(self, kind: str, payload) -> bool:
@@ -832,6 +840,22 @@ class HybridBot(twitchio.Client):
             self._deferred.append((kind, payload))
             return True
 
+    def _track_task(self, coro) -> None:
+        """Keep a create_task result alive until it finishes.
+
+        The event loop only holds a weak reference. A deferred YouTube check
+        that nothing else references can be collected before it runs.
+        """
+        task = asyncio.create_task(coro)
+        self._deferred_tasks.add(task)
+        task.add_done_callback(self._deferred_tasks.discard)
+
+    async def _deferred_youtube(self, video_id: str) -> None:
+        try:
+            await self.initial_youtube_check(video_id)
+        except Exception:
+            logger.exception("Deferred youtube notification failed")
+
     async def _replay_deferred(self, queued) -> None:
         if not queued:
             return
@@ -846,8 +870,10 @@ class HybridBot(twitchio.Client):
                     video_id, channel_id = payload
                     # Same filter as the live webhook. Channels are loaded
                     # during the restore this queue was waiting on.
-                    if channel_id in YOUTUBE_STREAMERS:
-                        await self.initial_youtube_check(video_id)
+                    # Do not await the check here. videos.list would sit in
+                    # front of the rest of the queue and the live sweep.
+                    if video_id and channel_id in YOUTUBE_STREAMERS:
+                        self._track_task(self._deferred_youtube(video_id))
             except Exception:
                 logger.exception("Deferred %s notification failed", kind)
 
@@ -859,6 +885,7 @@ class HybridBot(twitchio.Client):
         # start() already holds, including the gap before this task runs.
         # Setting it again covers an event_ready that did not come from start().
         self._startup_hold = True
+        self._startup_ready.clear()
         try:
             await discord_bot.wait_until_ready()
             await self.reconcile_streamers(initial=True)
@@ -868,11 +895,25 @@ class HybridBot(twitchio.Client):
                 self._startup_hold = False
                 queued = self._deferred
                 self._deferred = []
-            await self._replay_deferred(queued)
-        if not scheduler.running:
-            scheduler.start()
-        await self.setup_twitch_subs()
-        await self.announce_current_twitch_streams()
+            # Offlines from here until the sweep must not be undone by Helix.
+            self._record_startup_offlines = True
+            # Verification GETs are blocked on this event. Restore has the
+            # streamer list now, so they can be answered before replay.
+            self._startup_ready.set()
+            # Inside finally so a restore error cannot drop the queue. Due
+            # snipers and EventSub setup run before replay, so a videos.list
+            # or a Helix retry in a held notification cannot delay them.
+            try:
+                if not scheduler.running:
+                    scheduler.start()
+                try:
+                    await self.setup_twitch_subs()
+                finally:
+                    await self._replay_deferred(queued)
+                await self.announce_current_twitch_streams()
+            finally:
+                self._record_startup_offlines = False
+                self._startup_offline_ids.clear()
         await self.run_youtube_backfill()
         self._youtube_maint_task = asyncio.create_task(self.maintain_youtube_subs())
         if not autosave_state_task.is_running():
@@ -985,6 +1026,10 @@ class HybridBot(twitchio.Client):
 
     async def youtube_webhook_handler(self, request):
         if request.method == "GET":
+            # The hub is waiting on this response. Streamers are loaded in
+            # event_ready, after the server is already accepting GETs. A 404
+            # here is a rejected subscription, so wait for that load.
+            await self._startup_ready.wait()
             mode = request.query.get("hub.mode", "")
             topic = request.query.get("hub.topic", "")
             challenge = request.query.get("hub.challenge") or ""
@@ -1721,7 +1766,15 @@ class HybridBot(twitchio.Client):
                     f"   ℹ️ Ignoring offline for {s_login} stream {stream_id}; current is {current}"
                 )
                 return
+            had_alert = (
+                s_id in twitch_active_messages or s_id in twitch_active_stream_ids
+            )
             if await self.force_stream_offline(s_id, s_login):
+                # Remember a broadcast we actually retired. The startup sweep
+                # must not post it again while Helix still lists it. An offline
+                # for a channel we were not tracking stays eligible for that sweep.
+                if stream_id and had_alert and self._record_startup_offlines:
+                    self._startup_offline_ids.add((s_id, stream_id))
                 await sync_state_to_dynamodb()
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
@@ -1762,6 +1815,13 @@ class HybridBot(twitchio.Client):
                             async with _twitch_lock(s_id):
                                 if self._set_twitch_stream_id(s_id, stream.id):
                                     await sync_state_to_dynamodb()
+                        continue
+                    if (s_id, str(stream.id)) in self._startup_offline_ids:
+                        logger.info(
+                            "   ℹ️ Skipping %s stream %s; it went offline during startup",
+                            s_id,
+                            stream.id,
+                        )
                         continue
                     s_login = stream.user.name or TWITCH_STREAMERS.get(s_id, s_id)
                     await self._handle_twitch_online(
