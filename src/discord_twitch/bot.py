@@ -772,6 +772,28 @@ class EventSubAdapter(AiohttpAdapter):
                 return
 
 
+def _stream_event_key(payload) -> tuple[str, str] | None:
+    """(broadcaster id, stream id) from a stream.online or stream.offline payload."""
+    broadcaster = getattr(payload, "broadcaster", None)
+    s_id = str(getattr(broadcaster, "id", "") or "")
+    stream_id = str(getattr(payload, "id", "") or "")
+    if not s_id or not stream_id:
+        return None
+    return s_id, stream_id
+
+
+def _deferred_online_ids(queued) -> set[tuple[str, str]]:
+    """Stream ids whose stream.online is still waiting to be replayed."""
+    found: set[tuple[str, str]] = set()
+    for kind, payload in queued:
+        if kind != "online":
+            continue
+        key = _stream_event_key(payload)
+        if key:
+            found.add(key)
+    return found
+
+
 # Main Hybrid Bot Class
 class HybridBot(twitchio.Client):
     def __init__(self) -> None:
@@ -801,6 +823,12 @@ class HybridBot(twitchio.Client):
         # must not announce them again while Helix still lists them.
         self._startup_offline_ids: set[tuple[str, str]] = set()
         self._record_startup_offlines = False
+        # Online events held across restore. A live offline during the
+        # subscribe gap is newer than these and must win.
+        self._startup_deferred_online_ids: set[tuple[str, str]] = set()
+        # Deferred onlines a live offline already invalidated. Queued offlines
+        # do not go here: a later queued online is the newer event.
+        self._startup_blocked_onlines: set[tuple[str, str]] = set()
         super().__init__(
             client_id=TWITCH_CLIENT_ID,
             client_secret=TWITCH_CLIENT_SECRET,
@@ -863,9 +891,22 @@ class HybridBot(twitchio.Client):
         for kind, payload in queued:
             try:
                 if kind == "online":
+                    key = _stream_event_key(payload)
+                    # A live offline during subscribe already retired this
+                    # broadcast. Replaying the older online would post it again.
+                    if key and key in self._startup_blocked_onlines:
+                        logger.info(
+                            "   ℹ️ Skipping deferred online for %s stream %s; "
+                            "it went offline during startup",
+                            key[0],
+                            key[1],
+                        )
+                        continue
                     await self.event_stream_online(payload)
                 elif kind == "offline":
-                    await self.event_stream_offline(payload)
+                    # from_replay: this offline is not newer than an online
+                    # that is still waiting later in the queue.
+                    await self.event_stream_offline(payload, from_replay=True)
                 elif kind == "youtube":
                     video_id, channel_id = payload
                     # Same filter as the live webhook. Channels are loaded
@@ -896,6 +937,10 @@ class HybridBot(twitchio.Client):
                 queued = self._deferred
                 self._deferred = []
             # Offlines from here until the sweep must not be undone by Helix.
+            # Remember which onlines are still queued so an offline that
+            # arrives during subscribe can invalidate them. They are not in
+            # memory yet, so had_alert alone would miss that offline.
+            self._startup_deferred_online_ids = _deferred_online_ids(queued)
             self._record_startup_offlines = True
             # Verification GETs are blocked on this event. Restore has the
             # streamer list now, so they can be answered before replay.
@@ -914,6 +959,8 @@ class HybridBot(twitchio.Client):
             finally:
                 self._record_startup_offlines = False
                 self._startup_offline_ids.clear()
+                self._startup_deferred_online_ids.clear()
+                self._startup_blocked_onlines.clear()
         await self.run_youtube_backfill()
         self._youtube_maint_task = asyncio.create_task(self.maintain_youtube_subs())
         if not autosave_state_task.is_running():
@@ -1750,7 +1797,9 @@ class HybridBot(twitchio.Client):
         for s_id, s_name in list(TWITCH_STREAMERS.items()):
             await self._subscribe_twitch(s_id, s_name)
 
-    async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:
+    async def event_stream_offline(
+        self, payload: twitchio.StreamOffline, *, from_replay: bool = False
+    ) -> None:
         if await self._defer_startup("offline", payload):
             return
         s_id = str(payload.broadcaster.id)
@@ -1772,9 +1821,19 @@ class HybridBot(twitchio.Client):
             if await self.force_stream_offline(s_id, s_login):
                 # Remember a broadcast we actually retired. The startup sweep
                 # must not post it again while Helix still lists it. An offline
-                # for a channel we were not tracking stays eligible for that sweep.
-                if stream_id and had_alert and self._record_startup_offlines:
+                # for a channel we were not tracking stays eligible for that
+                # sweep, unless it ends a stream.online that is still queued:
+                # that online is not in memory yet, and replaying it would
+                # announce a broadcast Twitch already ended.
+                pending_online = (s_id, stream_id) in self._startup_deferred_online_ids
+                if stream_id and self._record_startup_offlines and (
+                    had_alert or pending_online
+                ):
                     self._startup_offline_ids.add((s_id, stream_id))
+                    # A queued offline is not newer than an online later in
+                    # the same queue. A live offline during subscribe is.
+                    if not from_replay:
+                        self._startup_blocked_onlines.add((s_id, stream_id))
                 await sync_state_to_dynamodb()
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:
